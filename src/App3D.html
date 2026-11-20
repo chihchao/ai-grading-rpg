@@ -1,0 +1,514 @@
+<script>
+  /* 3D 黏土風介面的 UI 程式；共用函式在 Shared.html，3D 場景在 Scene3D.html */
+  let appState = {
+    user: null,
+    authRelayUrl: '',
+    assignments: [],
+    mySubmissions: [],
+    nickname: '',
+    profile: null,
+    badgeCatalog: [],
+    settings: { leaderboardEnabled: true, mentorPersona: '' },
+    leaderboard: null,
+    selectedFiles: [],
+    currentQuestId: '',
+    sheetMode: '',
+    viewMode: 'auto'
+  };
+
+  const world = { ready: false, failed: false, started: false };
+
+  // ==========================================
+  // 3D 場景載入（失敗時改用任務清單）
+  // ==========================================
+
+  window.addEventListener('clayworld-ready', startWorld);
+  window.addEventListener('clayworld-failed', worldFailed);
+  setTimeout(function () { if (!world.started) worldFailed(); }, 12000);
+
+  function startWorld() {
+    if (world.started || !window.ClayWorld) return;
+    try {
+      window.ClayWorld.init(document.getElementById('world'), document.getElementById('labels'), {
+        onQuestClick: openQuest,
+        onAvatarClick: function () { openSheet('stats'); }
+      });
+      world.started = true;
+      world.ready = true;
+      pushWorldData();
+    } catch (err) {
+      console.error(err);
+      worldFailed();
+    }
+  }
+
+  function worldFailed() {
+    if (world.started || world.failed) return;
+    world.failed = true;
+    document.querySelector('.hud-hint').classList.add('hidden');
+    if (appState.user) {
+      showToast('3D 場景無法載入（瀏覽器可能不支援 WebGL），先用任務清單繼續冒險吧！', 6000);
+      openSheet('questlist');
+    }
+  }
+
+  function pushWorldData() {
+    if (!world.ready || !appState.user) return;
+    window.ClayWorld.setData({ assignments: appState.assignments, profile: appState.profile });
+  }
+
+  // ==========================================
+  // 初始化資料
+  // ==========================================
+
+  function onInitSuccess(data) {
+    document.getElementById('loadingCard').classList.add('hidden');
+    appState.authRelayUrl = data.authRelayUrl || '';
+
+    if (!data.authenticated) {
+      document.getElementById('mainApp').classList.add('hidden');
+      document.getElementById('labels').classList.add('hidden');
+      closeSheet();
+      document.getElementById('authCard').classList.remove('hidden');
+      if (appState.authRelayUrl) {
+        document.getElementById('relayLoginLink').href = appState.authRelayUrl;
+        document.getElementById('relayLoginSection').classList.remove('hidden');
+      }
+      return;
+    }
+
+    hideAuthError();
+    document.getElementById('authCard').classList.add('hidden');
+    document.getElementById('mainApp').classList.remove('hidden');
+    document.getElementById('labels').classList.remove('hidden');
+
+    appState.user = data.user;
+    appState.assignments = data.assignments || [];
+    appState.mySubmissions = data.mySubmissions || [];
+    appState.nickname = data.nickname || '';
+    appState.profile = data.profile;
+    appState.badgeCatalog = data.badgeCatalog || [];
+    appState.settings = data.settings || appState.settings;
+    appState.leaderboard = data.leaderboard;
+
+    document.getElementById('apiWarning').classList.toggle('hidden', Boolean(data.hasApiKey));
+
+    renderHud();
+    renderMenu();
+    pushWorldData();
+    if (world.failed) openSheet('questlist');
+    else if (appState.sheetMode && appState.sheetMode !== 'quest') openSheet(appState.sheetMode);
+  }
+
+  function avatarEmoji(level) {
+    if (level >= 16) return '🐉';
+    if (level >= 12) return '👑';
+    if (level >= 8) return '🧣';
+    if (level >= 5) return '🧙';
+    if (level >= 3) return '🌱';
+    return '🧸';
+  }
+
+  function renderHud() {
+    const p = appState.profile;
+    if (!p) return;
+    const inLevel = p.totalXp - p.levelFloorXp;
+    const need = p.nextLevelXp - p.levelFloorXp;
+    document.getElementById('hudAvatar').textContent = avatarEmoji(p.level);
+    document.getElementById('hudName').textContent = appState.nickname;
+    document.getElementById('hudLevel').textContent = 'Lv ' + p.level;
+    document.getElementById('hudTitle').textContent = p.title;
+    document.getElementById('hudXpFill').style.width = Math.round(Math.max(0, Math.min(1, p.progress)) * 100) + '%';
+    document.getElementById('hudXpText').textContent =
+      'XP ' + inLevel + ' / ' + need + '・總計 ' + p.totalXp + '・徽章 ' + p.badges.length + ' / ' + appState.badgeCatalog.length;
+  }
+
+  function renderMenu() {
+    const u = appState.user;
+    const items = [
+      '<button class="btn" onclick="openSheet(\'questlist\')">📜 任務</button>',
+      '<button class="btn" onclick="openSheet(\'stats\')">🌟 能力</button>',
+      '<button class="btn" onclick="openSheet(\'badges\')">🏅 徽章</button>'
+    ];
+    if (Array.isArray(appState.leaderboard)) {
+      items.push('<button class="btn" onclick="openSheet(\'leaderboard\')">🏆 排行</button>');
+    }
+    items.push('<button class="btn" onclick="openSheet(\'history\')">🗂️ 紀錄</button>');
+    if (u.isTeacher && uiUrl('2d')) {
+      items.push('<a class="btn btn-yellow" target="_top" href="' + escapeHtml(uiUrl('2d')) + '">🧑‍🏫 教師後台</a>');
+    } else if (uiUrl('2d')) {
+      items.push('<a class="btn" target="_top" href="' + escapeHtml(uiUrl('2d')) + '">🖥️ 2D 介面</a>');
+    }
+    if (u.authMethod !== 'GOOGLE_SESSION') {
+      items.push('<button class="btn" onclick="logoutSession()">🚪 登出</button>');
+    }
+    document.getElementById('hudMenu').innerHTML = items.join('');
+  }
+
+  // ==========================================
+  // 側邊面板
+  // ==========================================
+
+  const SHEET_TITLES = {
+    questlist: '📜 任務清單', stats: '🌟 我的能力', badges: '🏅 成就徽章',
+    leaderboard: '🏆 冒險者排行榜', history: '🗂️ 挑戰紀錄'
+  };
+
+  function openSheet(mode) {
+    appState.sheetMode = mode;
+    document.getElementById('sheetQuest').classList.toggle('hidden', mode !== 'quest');
+    const dyn = document.getElementById('sheetDynamic');
+    dyn.classList.toggle('hidden', mode === 'quest');
+    if (mode !== 'quest') {
+      document.getElementById('sheetTitle').textContent = SHEET_TITLES[mode] || '';
+      dyn.innerHTML = {
+        questlist: renderQuestListPanel,
+        stats: renderStatsPanel,
+        badges: renderBadgesPanel,
+        leaderboard: renderLeaderboardPanel,
+        history: renderHistoryPanel
+      }[mode]();
+    }
+    const sheet = document.getElementById('sheet');
+    sheet.classList.add('open');
+    sheet.setAttribute('aria-hidden', 'false');
+    sheet.querySelector('.sheet-body').scrollTop = 0;
+  }
+
+  function closeSheet() {
+    appState.sheetMode = '';
+    const sheet = document.getElementById('sheet');
+    sheet.classList.remove('open');
+    sheet.setAttribute('aria-hidden', 'true');
+  }
+
+  document.addEventListener('keydown', function (e) {
+    if (e.key !== 'Escape') return;
+    if (document.getElementById('detailModal').classList.contains('open')) closeModal();
+    else closeSheet();
+  });
+
+  function renderQuestListPanel() {
+    if (!appState.assignments.length) return '<p class="muted">小島上還沒有任務，等等老師發布吧！</p>';
+    const quests = (appState.profile && appState.profile.quests) || {};
+    const list = appState.assignments.slice().sort(function (a, b) {
+      if (a.isActive !== b.isActive) return a.isActive ? -1 : 1;
+      if (a.questType !== b.questType) return a.questType === 'main' ? -1 : 1;
+      return 0;
+    });
+    return list.map(function (a) {
+      const q = quests[a.assignmentId];
+      let status = a.isActive ? '<span class="chip">待挑戰</span>' : '<span class="chip chip-closed">已關閉</span>';
+      if (q && q.status === 'perfect') status = '<span class="chip chip-gold">💎 滿分</span>';
+      else if (q) status = '<span class="chip chip-open">✔ ' + q.score + ' 分</span>';
+      return '<div class="history-item quest-item" onclick="openQuest(\'' + escapeHtml(a.assignmentId) + '\')">' +
+        '<div><strong>' + escapeHtml(a.title) + '</strong>' +
+        '<div class="muted"><span class="stars">' + stars(a.difficulty) + '</span> · <span class="xp-tag">' + a.xpReward + ' XP</span> · ' +
+        (a.questType === 'side' ? '支線' : '主線') + '</div></div>' + status + '</div>';
+    }).join('');
+  }
+
+  function renderStatsPanel() {
+    const p = appState.profile;
+    const names = Object.keys(p.stats);
+    const maxVal = Math.max(50, names.length ? Math.max.apply(null, names.map(function (n) { return p.stats[n]; })) : 0);
+    const bars = names.sort(function (a, b) { return p.stats[b] - p.stats[a]; }).map(function (n) {
+      return '<div class="comp-row"><span>' + escapeHtml(n) + '</span>' +
+        '<div class="comp-track"><div class="comp-fill" style="width:' + Math.round(p.stats[n] / maxVal * 100) + '%;"></div></div>' +
+        '<span>' + p.stats[n] + '</span></div>';
+    }).join('');
+    return '<div class="section" style="text-align:center;">' +
+      '<div style="font-size:2.6rem;">' + avatarEmoji(p.level) + '</div>' +
+      '<strong style="font-size:1.15rem;">' + escapeHtml(appState.nickname) + '</strong>' +
+      '<div><span class="hud-level">Lv ' + p.level + '</span><span class="hud-title">' + escapeHtml(p.title) + '</span></div>' +
+      '<div class="muted" style="margin-top:4px;">總 XP ' + p.totalXp + '，距離 Lv ' + (p.level + 1) + ' 還差 ' + (p.nextLevelXp - p.totalXp) + '</div>' +
+      '</div>' +
+      '<div class="section">' +
+      '<h3>素養與核心能力</h3>' +
+      (names.length
+        ? '<div class="radar-wrap">' + radarSvg(p.stats) + '</div>' + bars
+        : '<p class="muted">完成有設定能力的任務後，這裡就會長出你的能力雷達圖 ✨</p>') +
+      '<p class="muted" style="margin:10px 0 0;">每份任務只採計最後一次挑戰，同名能力會跨任務累積。</p>' +
+      '</div>';
+  }
+
+  function radarSvg(stats) {
+    const names = Object.keys(stats).slice(0, 8);
+    if (names.length < 3) return '';
+    const maxVal = Math.max(50, Math.max.apply(null, names.map(function (n) { return stats[n]; })));
+    const cx = 160, cy = 130, r = 90, n = names.length;
+    function pt(i, k) {
+      const a = -Math.PI / 2 + i * 2 * Math.PI / n;
+      return [cx + Math.cos(a) * r * k, cy + Math.sin(a) * r * k];
+    }
+    let svg = '<svg viewBox="0 0 320 260" xmlns="http://www.w3.org/2000/svg">';
+    [1, 0.75, 0.5, 0.25].forEach(function (k, idx) {
+      svg += '<polygon points="' + names.map(function (_, i) { return pt(i, k).join(','); }).join(' ') +
+        '" fill="' + (idx % 2 ? '#fdf7ff' : '#f6eefc') + '" stroke="#e6d9f2" stroke-width="1.5" stroke-linejoin="round"/>';
+    });
+    svg += '<polygon points="' + names.map(function (nm, i) { return pt(i, stats[nm] / maxVal).join(','); }).join(' ') +
+      '" fill="rgba(255,159,182,0.45)" stroke="#f27a97" stroke-width="3" stroke-linejoin="round"/>';
+    names.forEach(function (nm, i) {
+      const d = pt(i, stats[nm] / maxVal);
+      svg += '<circle cx="' + d[0] + '" cy="' + d[1] + '" r="5" fill="#fff" stroke="#f27a97" stroke-width="2.5"/>';
+      const lp = pt(i, 1.2);
+      const anchor = Math.abs(lp[0] - cx) < 5 ? 'middle' : (lp[0] > cx ? 'start' : 'end');
+      svg += '<text x="' + lp[0] + '" y="' + (lp[1] + 4) + '" font-size="12" fill="#4a3f55" text-anchor="' + anchor + '">' +
+        escapeHtml(nm.length > 6 ? nm.slice(0, 6) + '…' : nm) + '</text>';
+    });
+    return svg + '</svg>';
+  }
+
+  function renderBadgesPanel() {
+    const owned = (appState.profile && appState.profile.badges) || [];
+    return '<div class="badge-wall">' + appState.badgeCatalog.map(function (b) {
+      const has = owned.indexOf(b.id) !== -1;
+      return '<div class="badge-tile ' + (has ? 'unlocked' : 'locked') + '">' +
+        '<div class="icon">' + b.icon + '</div><strong>' + escapeHtml(b.name) + '</strong>' +
+        '<div class="muted">' + escapeHtml(b.desc) + '</div>' +
+        '<div class="muted" style="margin-top:4px;">' + (has ? '✔ 已解鎖' : '🔒 未解鎖') + '</div></div>';
+    }).join('') + '</div>';
+  }
+
+  function renderLeaderboardPanel() {
+    const list = appState.leaderboard || [];
+    if (!list.length) return '<p class="muted">還沒有冒險者上榜，快去完成第一個任務吧！</p>';
+    const medals = { 1: '🥇', 2: '🥈', 3: '🥉' };
+    return list.map(function (r) {
+      return '<div class="rank-row' + (r.isMe ? ' me' : '') + '">' +
+        '<div class="rank-no">' + (medals[r.rank] || r.rank) + '</div>' +
+        '<div><strong>' + escapeHtml(r.nickname) + (r.isMe ? '（你）' : '') + '</strong>' +
+        '<div class="muted">Lv ' + r.level + ' ' + escapeHtml(r.title) + ' · 🏅 ' + r.badgeCount + '</div></div>' +
+        '<div class="xp-tag">' + r.totalXp + ' XP</div></div>';
+    }).join('');
+  }
+
+  function renderHistoryPanel() {
+    if (!appState.mySubmissions.length) return '<p class="muted">還沒有挑戰紀錄。</p>';
+    return appState.mySubmissions.map(historyItem).join('');
+  }
+
+  function historyItem(s) {
+    return '<div class="history-item">' +
+      '<div><strong>' + escapeHtml(getAssignmentTitle_(s.assignmentId)) + '</strong> · 第 ' + s.attemptNumber + ' 次 ' +
+      (s.isLatest ? '<span class="chip chip-open">採計</span>' : '<span class="chip">歷史</span>') +
+      '<div class="muted">' + formatTime(s.submittedAt) + ' · ' + s.aiScore + ' 分' +
+      (s.xpEarned !== null ? ' · <span class="xp-tag">' + s.xpEarned + ' XP</span>' : '') + '</div></div>' +
+      '<button class="btn btn-sm" onclick="openSubmissionModal(\'' + escapeHtml(s.submissionId) + '\')">檢視</button></div>';
+  }
+
+  // ==========================================
+  // 任務詳情與繳交
+  // ==========================================
+
+  function openQuest(assignmentId) {
+    const asg = appState.assignments.find(function (a) { return a.assignmentId === assignmentId; });
+    if (!asg) return;
+    if (appState.currentQuestId !== assignmentId) {
+      document.getElementById('studentTextAnswer').value = '';
+      appState.selectedFiles = [];
+      renderSelectedFiles();
+    }
+    appState.currentQuestId = assignmentId;
+    if (world.ready) window.ClayWorld.focusQuest(assignmentId);
+
+    document.getElementById('sheetTitle').textContent = (asg.questType === 'side' ? '🍄 ' : '🏠 ') + asg.title;
+    const canSubmit = asg.isActive || appState.user.isTeacher;
+    document.getElementById('submissionFormWrap').classList.toggle('hidden', !canSubmit);
+
+    document.getElementById('questInfo').innerHTML =
+      '<div class="section">' +
+      '<div class="chips" style="margin-bottom:8px;">' +
+      (asg.questType === 'side' ? '<span class="chip chip-side">支線任務</span>' : '<span class="chip chip-main">主線任務</span>') +
+      (asg.isActive ? '<span class="chip chip-open">開放挑戰中</span>' : '<span class="chip chip-closed">已關閉</span>') +
+      '<span class="chip"><span class="stars">' + stars(asg.difficulty) + '</span></span>' +
+      '<span class="chip chip-gold">最高 ' + asg.xpReward + ' XP</span>' +
+      '<span class="chip">滿分 ' + asg.maxScore + '</span>' +
+      '</div>' +
+      (asg.competencies.length
+        ? '<div style="margin-bottom:8px;"><strong>可培養的能力</strong><div class="chips" style="margin-top:4px;">' +
+          asg.competencies.map(function (c) { return '<span class="chip chip-main">' + escapeHtml(c.name) + ' ×' + c.weight + '</span>'; }).join('') +
+          '</div></div>'
+        : '') +
+      '<strong>任務說明</strong><p class="pre-wrap" style="margin:4px 0 10px;">' + escapeHtml(asg.description || '無額外說明') + '</p>' +
+      '<strong>評分標準</strong><p class="pre-wrap" style="margin:4px 0 0;">' + escapeHtml(asg.rubric) + '</p>' +
+      '</div>';
+
+    renderQuestResults(asg);
+    openSheet('quest');
+  }
+
+  function renderQuestResults(asg) {
+    const list = appState.mySubmissions.filter(function (s) { return s.assignmentId === asg.assignmentId; });
+    const latestEl = document.getElementById('questLatest');
+    const historyEl = document.getElementById('questHistory');
+    if (!list.length) {
+      latestEl.innerHTML = '';
+      historyEl.innerHTML = '';
+      return;
+    }
+    const latest = list.find(function (s) { return s.isLatest; }) || list[0];
+    latestEl.innerHTML =
+      '<div class="section">' +
+      '<h3>目前採計成績（第 ' + latest.attemptNumber + ' 次）</h3>' +
+      '<div class="score-big">' + latest.aiScore + ' <span class="muted" style="font-size:1rem;">/ ' + asg.maxScore + '</span> ' +
+      '<span class="xp-tag" style="font-size:1rem;">+' + (latest.xpEarned || 0) + ' XP</span></div>' +
+      mentorBox(latest.mentorComment) +
+      competencyBars(latest.competencyResults) +
+      '<p style="margin:10px 0 4px;"><strong>評分理由</strong></p><p class="pre-wrap" style="margin:0;">' + escapeHtml(latest.aiReasoning) + '</p>' +
+      '<p style="margin:10px 0 4px;"><strong>AI 回饋</strong></p><p class="pre-wrap" style="margin:0;">' + escapeHtml(latest.aiFeedback) + '</p>' +
+      '</div>';
+    historyEl.innerHTML = '<h3 style="margin:6px 4px 10px;">挑戰紀錄</h3>' + list.map(historyItem).join('');
+  }
+
+  function handleSubmitHomework() {
+    const asgId = appState.currentQuestId;
+    const textContent = document.getElementById('studentTextAnswer').value;
+    if (!asgId) return;
+    if (!textContent.trim() && appState.selectedFiles.length === 0) {
+      alert('請填寫作業內容，或上傳至少一份文字檔案。');
+      return;
+    }
+
+    const btn = document.getElementById('submitHomeworkBtn');
+    btn.disabled = true;
+    btn.textContent = '🔮 導師正在認真批改中…';
+
+    google.script.run
+      .withSuccessHandler(function (res) {
+        btn.disabled = false;
+        btn.textContent = '✨ 送出挑戰，請導師評分';
+        appState.mySubmissions = res.mySubmissions;
+        appState.profile = res.profile;
+        if (res.leaderboard !== undefined) appState.leaderboard = res.leaderboard;
+        document.getElementById('studentTextAnswer').value = '';
+        appState.selectedFiles = [];
+        renderSelectedFiles();
+        renderHud();
+        renderMenu();
+        pushWorldData();
+        const asg = appState.assignments.find(function (a) { return a.assignmentId === asgId; });
+        if (asg) renderQuestResults(asg);
+        if (world.ready) window.ClayWorld.celebrate(res.result.levelAfter > res.result.levelBefore);
+        openResultModal(res);
+      })
+      .withFailureHandler(function (err) {
+        btn.disabled = false;
+        btn.textContent = '✨ 送出挑戰，請導師評分';
+        alert('繳交失敗：' + err.message);
+      })
+      .submitAssignment(token_(), {
+        assignmentId: asgId,
+        textContent: textContent,
+        files: appState.selectedFiles
+      });
+  }
+
+  function handleEditNickname() {
+    const next = prompt('輸入新的暱稱（1–20 字，會顯示在排行榜上）', appState.nickname);
+    if (next === null) return;
+    google.script.run
+      .withSuccessHandler(function (res) {
+        appState.nickname = res.nickname;
+        renderHud();
+        loadInitData(); // 重新取得排行榜
+      })
+      .withFailureHandler(function (err) { alert('修改失敗：' + err.message); })
+      .updateNickname(token_(), next);
+  }
+
+  // ==========================================
+  // Modal：結算與詳情
+  // ==========================================
+
+  function openResultModal(res) {
+    const s = res.submission;
+    const r = res.result;
+    const asg = appState.assignments.find(function (a) { return a.assignmentId === s.assignmentId; }) || { maxScore: 100 };
+    const xpLine = r.xpDelta > 0 ? '+' + r.xpDelta + ' XP' : (r.xpDelta < 0 ? r.xpDelta + ' XP' : '±0 XP');
+
+    document.getElementById('modalTitle').textContent = '🎊 任務結算';
+    document.getElementById('modalBody').innerHTML =
+      '<div class="result-hero">' +
+      '<div class="muted">' + escapeHtml(getAssignmentTitle_(s.assignmentId)) + '</div>' +
+      '<div class="score-big">' + s.aiScore + ' <span class="muted" style="font-size:1rem;">/ ' + asg.maxScore + ' 分</span></div>' +
+      '<div class="result-xp">' + xpLine + '</div>' +
+      (s.attemptNumber > 1 ? '<div class="muted">本次 ' + s.xpEarned + ' XP；重新挑戰只採計最後一次，上方是總 XP 的變化</div>' : '') +
+      (r.levelAfter > r.levelBefore
+        ? '<div class="level-up">🎉 升級！Lv ' + r.levelBefore + ' → Lv ' + r.levelAfter + '　' + escapeHtml(r.titleAfter) + '</div>'
+        : '') +
+      '</div>' +
+      mentorBox(s.mentorComment) +
+      competencyBars(s.competencyResults) +
+      (r.statDeltas.length
+        ? '<div class="section"><h3>能力值變化</h3>' + r.statDeltas.map(function (d) {
+            return '<div>' + escapeHtml(d.name) + '：' + d.value + ' <span class="' + (d.delta > 0 ? 'delta-up' : 'delta-down') + '">(' +
+              (d.delta > 0 ? '+' : '') + d.delta + ')</span></div>';
+          }).join('') + '</div>'
+        : '') +
+      (r.newBadges.length
+        ? '<h3>解鎖新徽章！</h3><div class="badge-wall" style="margin-bottom:14px;">' + r.newBadges.map(function (b) {
+            return '<div class="badge-tile unlocked"><div class="icon">' + b.icon + '</div><strong>' + escapeHtml(b.name) + '</strong>' +
+              '<div class="muted">' + escapeHtml(b.desc) + '</div></div>';
+          }).join('') + '</div>'
+        : '') +
+      '<div class="section"><h3>評分理由</h3><p class="pre-wrap" style="margin:0;">' + escapeHtml(s.aiReasoning) + '</p></div>' +
+      '<div class="section"><h3>AI 回饋</h3><p class="pre-wrap" style="margin:0;">' + escapeHtml(s.aiFeedback) + '</p></div>' +
+      '<button class="btn btn-primary" style="width:100%;" onclick="closeModal()">好耶！繼續冒險</button>';
+    document.getElementById('detailModal').classList.add('open');
+  }
+
+  function openSubmissionModal(submissionId) {
+    const s = appState.mySubmissions.find(function (x) { return x.submissionId === submissionId; });
+    if (!s) return;
+    document.getElementById('modalTitle').textContent = getAssignmentTitle_(s.assignmentId) + '・第 ' + s.attemptNumber + ' 次';
+    document.getElementById('modalBody').innerHTML =
+      '<div class="muted" style="margin-bottom:8px;">' + formatTime(s.submittedAt) + '</div>' +
+      '<div class="score-big">' + s.aiScore + (s.xpEarned !== null ? ' <span class="xp-tag" style="font-size:1rem;">' + s.xpEarned + ' XP</span>' : '') + '</div>' +
+      mentorBox(s.mentorComment) +
+      competencyBars(s.competencyResults) +
+      '<div class="section"><h3>評分理由</h3><p class="pre-wrap" style="margin:0;">' + escapeHtml(s.aiReasoning) + '</p></div>' +
+      '<div class="section"><h3>AI 回饋</h3><p class="pre-wrap" style="margin:0;">' + escapeHtml(s.aiFeedback) + '</p></div>' +
+      '<h3>作答內容</h3><div class="pre-box">' + escapeHtml(s.textContent || '（無填寫文字）') + '</div>' +
+      '<h3>上傳檔案（' + escapeHtml(s.fileNames || '無') + '）</h3><div class="pre-box">' + escapeHtml(s.filesFullText || '（無上傳檔案）') + '</div>';
+    document.getElementById('detailModal').classList.add('open');
+  }
+
+  function closeModal() {
+    document.getElementById('detailModal').classList.remove('open');
+  }
+
+  // ==========================================
+  // 共用片段
+  // ==========================================
+
+  function competencyBars(results) {
+    if (!results || !results.length) return '';
+    return '<div class="section"><h3>素養與核心能力評價</h3>' + results.map(function (c) {
+      return '<div class="comp-row"><span>' + escapeHtml(c.name) + '</span>' +
+        '<div class="comp-track"><div class="comp-fill" style="width:' + c.rating + '%;"></div></div>' +
+        '<span>' + c.rating + '</span></div>' +
+        (c.comment ? '<div class="muted" style="margin:2px 0 6px;">' + escapeHtml(c.comment) + '</div>' : '');
+    }).join('') + '</div>';
+  }
+
+  function mentorBox(text) {
+    if (!text) return '';
+    return '<div class="mentor-box"><div class="icon">🧙</div><p>' + escapeHtml(text) + '</p></div>';
+  }
+
+  let toastTimer = null;
+  function showToast(msg, ms) {
+    let el = document.getElementById('toastMsg');
+    if (!el) {
+      el = document.createElement('div');
+      el.id = 'toastMsg';
+      el.className = 'clay toast';
+      document.body.appendChild(el);
+    }
+    el.textContent = msg;
+    el.classList.remove('hidden');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () { el.classList.add('hidden'); }, ms || 3000);
+  }
+</script>

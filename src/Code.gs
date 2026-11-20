@@ -20,9 +20,16 @@
  * - Rpg.gs     RPG 規則（純函式）
  */
 
+/**
+ * 預設載入 3D 黏土風介面（Index3D）；網址加上 ?ui=2d 改用 2D 介面（Index）。
+ * 兩套介面共用同一組後端函式與資料。
+ */
 function doGet(e) {
-  const template = HtmlService.createTemplateFromFile('Index');
-  template.initialRelayToken = (e && e.parameter && e.parameter.authToken) ? String(e.parameter.authToken) : '';
+  const params = (e && e.parameter) || {};
+  const use2d = String(params.ui || '').toLowerCase() === '2d';
+  const template = HtmlService.createTemplateFromFile(use2d ? 'Index' : 'Index3D');
+  template.initialRelayToken = params.authToken ? String(params.authToken) : '';
+  template.appUrl = getAppUrl_();
 
   return template
     .evaluate()
@@ -34,6 +41,15 @@ function doGet(e) {
 /** 讓 Index.html 以 <?!= include('Styles') ?> 載入其他 HTML 檔 */
 function include(filename) {
   return HtmlService.createHtmlOutputFromFile(filename).getContent();
+}
+
+/** Web App 的 /exec 網址，用於 2D / 3D 介面互相切換；尚未部署時回傳空字串 */
+function getAppUrl_() {
+  try {
+    return ScriptApp.getService().getUrl() || '';
+  } catch (err) {
+    return '';
+  }
 }
 
 function getProps_() {

@@ -1,8 +1,5 @@
 <script>
-  const INITIAL_RELAY_TOKEN = (document.getElementById('relayTokenCarrier').dataset.token || '').trim();
-  const SESSION_KEY = 'ai_rpg_session_token';
-  const CONSUMED_RELAY_KEY = 'ai_rpg_consumed_relay';
-
+  /* 2D 介面專用程式；共用函式在 Shared.html */
   let appState = {
     user: null,
     authRelayUrl: '',
@@ -18,50 +15,6 @@
     currentQuestId: '',
     viewMode: 'auto'
   };
-
-  const ALLOWED_EXT = new Set([
-    'txt','md','csv','ipynb','py','json','js','jsx','ts','tsx','html','htm',
-    'css','scss','xml','yaml','yml','sql','java','c','cpp','h','hpp','cs',
-    'go','rs','php','rb','r','sh','bat','ps1','log','ini','toml','tex'
-  ]);
-
-  window.addEventListener('DOMContentLoaded', function () {
-    setupFileEvents();
-    bootstrap();
-  });
-
-  function token_() {
-    return sessionStorage.getItem(SESSION_KEY) || '';
-  }
-
-  function bootstrap() {
-    const consumedToken = sessionStorage.getItem(CONSUMED_RELAY_KEY) || '';
-    if (INITIAL_RELAY_TOKEN && INITIAL_RELAY_TOKEN !== consumedToken) {
-      sessionStorage.setItem(CONSUMED_RELAY_KEY, INITIAL_RELAY_TOKEN);
-      google.script.run
-        .withSuccessHandler(function (res) {
-          sessionStorage.setItem(SESSION_KEY, res.sessionToken);
-          loadInitData();
-        })
-        .withFailureHandler(function (err) {
-          showAuthError(err.message);
-          loadInitData();
-        })
-        .exchangeRelayToken(INITIAL_RELAY_TOKEN);
-    } else {
-      loadInitData();
-    }
-  }
-
-  function loadInitData() {
-    google.script.run
-      .withSuccessHandler(onInitSuccess)
-      .withFailureHandler(function (err) {
-        document.getElementById('loadingCard').innerHTML =
-          '<div class="alert alert-error">系統載入失敗：' + escapeHtml(err.message) + '</div>';
-      })
-      .getAppInitData(token_());
-  }
 
   function onInitSuccess(data) {
     document.getElementById('loadingCard').classList.add('hidden');
@@ -118,10 +71,15 @@
       logoutBtn = '<button class="btn btn-outline btn-sm" onclick="logoutSession()">登出</button>';
     }
 
+    const switchUiLink = uiUrl('3d')
+      ? '<a class="btn btn-outline btn-sm" style="text-decoration:none;" target="_top" href="' + escapeHtml(uiUrl('3d')) + '">🧸 3D 介面</a>'
+      : '';
+
     document.getElementById('userBar').innerHTML =
       roleBadge +
       '<span>' + escapeHtml(u.email) + '</span>' +
       switchBtn +
+      switchUiLink +
       logoutBtn;
   }
 
@@ -148,68 +106,6 @@
   // ==========================================
   // 登入驗證動作
   // ==========================================
-
-  function handleSendOtp() {
-    const email = document.getElementById('otpEmail').value.trim();
-    const btn = document.getElementById('sendOtpBtn');
-    btn.disabled = true;
-    btn.textContent = '寄送中...';
-    hideAuthError();
-
-    google.script.run
-      .withSuccessHandler(function (res) {
-        btn.disabled = false;
-        btn.textContent = '重新寄送驗證碼';
-        document.getElementById('otpVerifyBox').classList.remove('hidden');
-        alert(res.message);
-      })
-      .withFailureHandler(function (err) {
-        btn.disabled = false;
-        btn.textContent = '寄送 6 位數驗證碼';
-        showAuthError(err.message);
-      })
-      .requestEmailOtp(email);
-  }
-
-  function handleVerifyOtp() {
-    const email = document.getElementById('otpEmail').value.trim();
-    const code = document.getElementById('otpCode').value.trim();
-    const btn = document.getElementById('verifyOtpBtn');
-    btn.disabled = true;
-    hideAuthError();
-
-    google.script.run
-      .withSuccessHandler(function (res) {
-        btn.disabled = false;
-        sessionStorage.setItem(SESSION_KEY, res.sessionToken);
-        loadInitData();
-      })
-      .withFailureHandler(function (err) {
-        btn.disabled = false;
-        showAuthError(err.message);
-      })
-      .verifyEmailOtp(email, code);
-  }
-
-  function logoutSession() {
-    sessionStorage.removeItem(SESSION_KEY);
-    appState.user = null;
-    appState.viewMode = 'auto';
-    onInitSuccess({
-      authenticated: false,
-      authRelayUrl: appState.authRelayUrl
-    });
-  }
-
-  function showAuthError(msg) {
-    const box = document.getElementById('authErrorBox');
-    box.textContent = msg;
-    box.classList.remove('hidden');
-  }
-
-  function hideAuthError() {
-    document.getElementById('authErrorBox').classList.add('hidden');
-  }
 
   // ==========================================
   // 教師端功能
@@ -782,98 +678,6 @@
   // 檔案讀取（沿用 ai-grading-gas）
   // ==========================================
 
-  function setupFileEvents() {
-    const fileInput = document.getElementById('fileInput');
-    const dropZone = document.getElementById('dropZone');
-
-    fileInput.addEventListener('change', function (e) {
-      handleFilesSelected(e.target.files);
-      fileInput.value = '';
-    });
-
-    dropZone.addEventListener('dragover', function (e) {
-      e.preventDefault();
-      dropZone.classList.add('dragover');
-    });
-    dropZone.addEventListener('dragleave', function () {
-      dropZone.classList.remove('dragover');
-    });
-    dropZone.addEventListener('drop', function (e) {
-      e.preventDefault();
-      dropZone.classList.remove('dragover');
-      handleFilesSelected(e.dataTransfer.files);
-    });
-  }
-
-  function handleFilesSelected(fileList) {
-    Array.from(fileList).forEach(function (file) {
-      const ext = (file.name.split('.').pop() || '').toLowerCase();
-      if (!ALLOWED_EXT.has(ext) && !file.type.startsWith('text/')) {
-        alert('檔案「' + file.name + '」不是支援的純文字或程式碼格式。');
-        return;
-      }
-      if (file.size > 2 * 1024 * 1024) {
-        alert('檔案「' + file.name + '」超過 2MB，請精簡後再上傳。');
-        return;
-      }
-
-      const reader = new FileReader();
-      reader.onload = function (evt) {
-        let text = String(evt.target.result || '');
-        if (text.indexOf('\u0000') !== -1) {
-          alert('檔案「' + file.name + '」偵測到二進位內容，無法以純文字方式儲存。');
-          return;
-        }
-        if (ext === 'ipynb') {
-          text = sanitizeIpynbText(text);
-        }
-        appState.selectedFiles.push({ name: file.name, content: text });
-        renderSelectedFiles();
-      };
-      reader.readAsText(file, 'UTF-8');
-    });
-  }
-
-  // 針對 Jupyter Notebook (.ipynb) 移除過大的圖片 Base64 輸出，保留所有程式碼與文字
-  function sanitizeIpynbText(rawText) {
-    try {
-      const nb = JSON.parse(rawText);
-      if (Array.isArray(nb.cells)) {
-        nb.cells.forEach(function (cell) {
-          if (Array.isArray(cell.outputs)) {
-            cell.outputs.forEach(function (out) {
-              if (out.data) {
-                Object.keys(out.data).forEach(function (mime) {
-                  if (mime.indexOf('image/') === 0) {
-                    out.data[mime] = '[已略過內嵌圖片 Base64 以符合試算表儲存限制]';
-                  }
-                });
-              }
-            });
-          }
-        });
-      }
-      return JSON.stringify(nb, null, 2);
-    } catch (e) {
-      return rawText;
-    }
-  }
-
-  function renderSelectedFiles() {
-    const el = document.getElementById('selectedFilesList');
-    el.innerHTML = appState.selectedFiles.map(function (f, idx) {
-      return '<div class="file-item">' +
-        '<span>' + escapeHtml(f.name) + ' <span class="muted">(' + f.content.length + ' 字元)</span></span>' +
-        '<button class="btn btn-secondary btn-sm" onclick="removeSelectedFile(' + idx + ')">移除</button>' +
-        '</div>';
-    }).join('');
-  }
-
-  function removeSelectedFile(idx) {
-    appState.selectedFiles.splice(idx, 1);
-    renderSelectedFiles();
-  }
-
   // ==========================================
   // 送出挑戰與結算畫面
   // ==========================================
@@ -1032,11 +836,6 @@
   // 共用片段與工具函式
   // ==========================================
 
-  function stars(n) {
-    const k = Math.max(1, Math.min(5, Number(n) || 1));
-    return '★'.repeat(k) + '☆'.repeat(5 - k);
-  }
-
   function questTypeBadge(a) {
     return a.questType === 'side'
       ? '<span class="badge badge-side">支線</span>'
@@ -1067,30 +866,4 @@
     return '<div class="mentor-box"><div class="icon">🧙</div><p>' + escapeHtml(text) + '</p></div>';
   }
 
-  function badgeIcons(ids) {
-    return (ids || []).map(function (id) {
-      const b = appState.badgeCatalog.find(function (x) { return x.id === id; });
-      return b ? '<span title="' + escapeHtml(b.name) + '">' + b.icon + '</span>' : '';
-    }).join(' ');
-  }
-
-  function getAssignmentTitle_(assignmentId) {
-    const a = appState.assignments.find(function (item) { return item.assignmentId === assignmentId; });
-    return a ? a.title : assignmentId;
-  }
-
-  function formatTime(iso) {
-    if (!iso) return '';
-    const d = new Date(iso);
-    return isNaN(d.getTime()) ? iso : d.toLocaleString('zh-TW', { hour12: false });
-  }
-
-  function escapeHtml(str) {
-    return String(str == null ? '' : str)
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;')
-      .replace(/'/g, '&#39;');
-  }
 </script>

@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <base target="_top">
+  <title>AI 評分 RPG</title>
+  <?!= include('Styles3D'); ?>
+</head>
+<body>
+  <!-- 後端傳入的 Relay Token 與 Web App 網址 -->
+  <div id="relayTokenCarrier" data-token="<?= initialRelayToken || '' ?>" data-app-url="<?= appUrl || '' ?>" class="hidden"></div>
+
+  <!-- 3D 黏土島嶼 -->
+  <div id="world"></div>
+  <div id="labels"></div>
+
+  <!-- 載入中 -->
+  <div id="loadingCard" class="clay center-card" style="text-align:center;">
+    <div class="bouncy"><span></span><span></span><span></span></div>
+    <p>正在捏黏土、準備你的冒險小島…</p>
+  </div>
+
+  <!-- 登入 -->
+  <div id="authCard" class="clay center-card hidden">
+    <h2>🧸 歡迎來到冒險小島</h2>
+    <p class="muted">請先用 Google / Email 帳號登入，開始你的冒險。</p>
+    <div id="authErrorBox" class="alert alert-error hidden"></div>
+
+    <div id="relayLoginSection" class="hidden" style="margin-bottom:18px;">
+      <a id="relayLoginLink" href="#" target="_top" class="btn btn-primary" style="width:100%;">使用 Google 帳號一鍵登入</a>
+      <div class="muted" style="text-align:center;margin:14px 0;">— 或使用 Email 驗證碼登入 —</div>
+    </div>
+
+    <div class="form-group">
+      <label for="otpEmail">Google / Email 信箱</label>
+      <input type="email" id="otpEmail" placeholder="example@gmail.com">
+    </div>
+    <div class="form-group">
+      <button class="btn btn-blue" id="sendOtpBtn" onclick="handleSendOtp()">寄送 6 位數驗證碼</button>
+    </div>
+    <div id="otpVerifyBox" class="hidden">
+      <div class="form-group">
+        <label for="otpCode">輸入驗證碼</label>
+        <input type="text" id="otpCode" placeholder="信箱收到的 6 位數驗證碼">
+      </div>
+      <button class="btn btn-primary" id="verifyOtpBtn" onclick="handleVerifyOtp()">驗證並登入</button>
+    </div>
+  </div>
+
+  <!-- 主畫面 HUD -->
+  <div id="mainApp" class="hidden">
+    <div class="clay hud-player">
+      <div class="hud-avatar" id="hudAvatar" onclick="openSheet('stats')" title="查看能力">🧸</div>
+      <div class="hud-info">
+        <div class="hud-name"><span id="hudName"></span> <button class="btn-link" onclick="handleEditNickname()">✏️</button></div>
+        <div><span class="hud-level" id="hudLevel">Lv 1</span><span class="hud-title" id="hudTitle"></span></div>
+        <div class="xp-bar"><div class="xp-fill" id="hudXpFill" style="width:0%;"></div></div>
+        <div class="xp-text" id="hudXpText"></div>
+      </div>
+    </div>
+
+    <div class="hud-menu" id="hudMenu"></div>
+    <div class="clay hud-hint">🖱️ 拖曳旋轉小島・滾輪縮放・點小屋開始任務</div>
+    <div id="apiWarning" class="clay toast alert-warn hidden">系統尚未設定 <code>GEMINI_API_KEY</code>，AI 評分暫時無法使用。</div>
+  </div>
+
+  <!-- 側邊面板 -->
+  <aside id="sheet" class="clay sheet" aria-hidden="true">
+    <div class="sheet-head">
+      <h2 id="sheetTitle"></h2>
+      <button class="btn btn-icon" onclick="closeSheet()" aria-label="關閉">✕</button>
+    </div>
+    <div class="sheet-body">
+      <!-- 任務詳情與繳交（固定結構，讓檔案上傳元件在載入時就存在） -->
+      <div id="sheetQuest" class="hidden">
+        <div id="questInfo"></div>
+        <div id="submissionFormWrap" class="section">
+          <h3>⚔️ 送出挑戰</h3>
+          <div class="form-group">
+            <label for="studentTextAnswer">作答區</label>
+            <textarea id="studentTextAnswer" placeholder="在這裡寫下你的作業內容、心得或程式碼說明…"></textarea>
+          </div>
+          <div class="form-group">
+            <label>上傳文字檔案</label>
+            <div class="drop-zone" id="dropZone" onclick="document.getElementById('fileInput').click()">
+              📎 點我選檔案，或把檔案拖進來<br>
+              <span class="muted">支援 txt、md、csv、ipynb、py、json、html… 可重複挑戰，只採計最後一次</span>
+            </div>
+            <input type="file" id="fileInput" class="hidden" multiple
+              accept=".txt,.md,.csv,.ipynb,.py,.json,.js,.jsx,.ts,.tsx,.html,.htm,.css,.scss,.xml,.yaml,.yml,.sql,.java,.c,.cpp,.h,.hpp,.cs,.go,.rs,.php,.rb,.r,.sh,.bat,.ps1,.log,.ini,.toml,.tex">
+            <div id="selectedFilesList" class="file-list"></div>
+          </div>
+          <button class="btn btn-primary" id="submitHomeworkBtn" style="width:100%;" onclick="handleSubmitHomework()">
+            ✨ 送出挑戰，請導師評分
+          </button>
+        </div>
+        <div id="questLatest"></div>
+        <div id="questHistory"></div>
+      </div>
+      <!-- 其他面板（能力、徽章、排行榜、紀錄、任務清單） -->
+      <div id="sheetDynamic"></div>
+    </div>
+  </aside>
+
+  <!-- 結算 / 詳情 -->
+  <div id="detailModal" class="modal-backdrop" onclick="if(event.target===this) closeModal()">
+    <div class="clay modal">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:8px;">
+        <h3 style="margin:0;" id="modalTitle"></h3>
+        <button class="btn btn-icon" onclick="closeModal()" aria-label="關閉">✕</button>
+      </div>
+      <div id="modalBody"></div>
+    </div>
+  </div>
+
+  <?!= include('Shared'); ?>
+  <?!= include('App3D'); ?>
+  <?!= include('Scene3D'); ?>
+</body>
+</html>

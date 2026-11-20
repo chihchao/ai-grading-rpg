@@ -8,7 +8,7 @@
 </head>
 <body>
   <!-- 安全傳遞後端 Relay Token，避免 GAS scriptlet JS 引號轉義問題 -->
-  <div id="relayTokenCarrier" data-token="<?= initialRelayToken || '' ?>" class="hidden"></div>
+  <div id="relayTokenCarrier" data-token="<?= initialRelayToken || '' ?>" data-app-url="<?= appUrl || '' ?>" class="hidden"></div>
 
   <header>
     <h1>⚔️ AI 評分 RPG <span style="font-size:0.78rem;font-weight:400;opacity:0.8;">Powered by Gemini</span></h1>
@@ -335,6 +335,7 @@
     </div>
   </div>
 
+  <?!= include('Shared'); ?>
   <?!= include('App'); ?>
 </body>
 </html>
