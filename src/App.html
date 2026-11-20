@@ -1,0 +1,1096 @@
+<script>
+  const INITIAL_RELAY_TOKEN = (document.getElementById('relayTokenCarrier').dataset.token || '').trim();
+  const SESSION_KEY = 'ai_rpg_session_token';
+  const CONSUMED_RELAY_KEY = 'ai_rpg_consumed_relay';
+
+  let appState = {
+    user: null,
+    authRelayUrl: '',
+    assignments: [],
+    mySubmissions: [],
+    nickname: '',
+    profile: null,
+    badgeCatalog: [],
+    settings: { leaderboardEnabled: true, mentorPersona: '' },
+    leaderboard: null,
+    teacherData: { allSubmissions: [], studentSummaries: [], playerSummaries: [] },
+    selectedFiles: [],
+    currentQuestId: '',
+    viewMode: 'auto'
+  };
+
+  const ALLOWED_EXT = new Set([
+    'txt','md','csv','ipynb','py','json','js','jsx','ts','tsx','html','htm',
+    'css','scss','xml','yaml','yml','sql','java','c','cpp','h','hpp','cs',
+    'go','rs','php','rb','r','sh','bat','ps1','log','ini','toml','tex'
+  ]);
+
+  window.addEventListener('DOMContentLoaded', function () {
+    setupFileEvents();
+    bootstrap();
+  });
+
+  function token_() {
+    return sessionStorage.getItem(SESSION_KEY) || '';
+  }
+
+  function bootstrap() {
+    const consumedToken = sessionStorage.getItem(CONSUMED_RELAY_KEY) || '';
+    if (INITIAL_RELAY_TOKEN && INITIAL_RELAY_TOKEN !== consumedToken) {
+      sessionStorage.setItem(CONSUMED_RELAY_KEY, INITIAL_RELAY_TOKEN);
+      google.script.run
+        .withSuccessHandler(function (res) {
+          sessionStorage.setItem(SESSION_KEY, res.sessionToken);
+          loadInitData();
+        })
+        .withFailureHandler(function (err) {
+          showAuthError(err.message);
+          loadInitData();
+        })
+        .exchangeRelayToken(INITIAL_RELAY_TOKEN);
+    } else {
+      loadInitData();
+    }
+  }
+
+  function loadInitData() {
+    google.script.run
+      .withSuccessHandler(onInitSuccess)
+      .withFailureHandler(function (err) {
+        document.getElementById('loadingCard').innerHTML =
+          '<div class="alert alert-error">系統載入失敗：' + escapeHtml(err.message) + '</div>';
+      })
+      .getAppInitData(token_());
+  }
+
+  function onInitSuccess(data) {
+    document.getElementById('loadingCard').classList.add('hidden');
+    appState.authRelayUrl = data.authRelayUrl || '';
+
+    if (!data.authenticated) {
+      document.getElementById('mainApp').classList.add('hidden');
+      document.getElementById('authCard').classList.remove('hidden');
+      document.getElementById('userBar').innerHTML = '<span id="userStatusText">尚未登入</span>';
+      if (appState.authRelayUrl) {
+        document.getElementById('relayLoginLink').href = appState.authRelayUrl;
+        document.getElementById('relayLoginSection').classList.remove('hidden');
+      }
+      return;
+    }
+
+    hideAuthError();
+    document.getElementById('authCard').classList.add('hidden');
+    document.getElementById('mainApp').classList.remove('hidden');
+
+    appState.user = data.user;
+    appState.assignments = data.assignments || [];
+    appState.mySubmissions = data.mySubmissions || [];
+    appState.nickname = data.nickname || '';
+    appState.profile = data.profile;
+    appState.badgeCatalog = data.badgeCatalog || [];
+    appState.settings = data.settings || appState.settings;
+    appState.leaderboard = data.leaderboard;
+
+    document.getElementById('apiWarning').classList.toggle('hidden', Boolean(data.hasApiKey));
+
+    if (appState.viewMode === 'auto') {
+      appState.viewMode = appState.user.isTeacher ? 'teacher' : 'student';
+    }
+
+    renderHeader();
+    renderCurrentView();
+  }
+
+  function renderHeader() {
+    const u = appState.user;
+    const roleBadge = u.isTeacher
+      ? '<span class="badge badge-teacher">教師</span>'
+      : '<span class="badge badge-student">冒險者</span>';
+
+    let switchBtn = '';
+    if (u.isTeacher) {
+      const nextLabel = appState.viewMode === 'teacher' ? '切換至學生冒險視角' : '返回教師管理後台';
+      switchBtn = '<button class="btn btn-outline btn-sm" onclick="toggleTeacherViewMode()">' + nextLabel + '</button>';
+    }
+
+    let logoutBtn = '';
+    if (u.authMethod !== 'GOOGLE_SESSION') {
+      logoutBtn = '<button class="btn btn-outline btn-sm" onclick="logoutSession()">登出</button>';
+    }
+
+    document.getElementById('userBar').innerHTML =
+      roleBadge +
+      '<span>' + escapeHtml(u.email) + '</span>' +
+      switchBtn +
+      logoutBtn;
+  }
+
+  function toggleTeacherViewMode() {
+    appState.viewMode = appState.viewMode === 'teacher' ? 'student' : 'teacher';
+    renderHeader();
+    renderCurrentView();
+  }
+
+  function renderCurrentView() {
+    const isTeacherView = appState.user.isTeacher && appState.viewMode === 'teacher';
+    document.getElementById('teacherView').classList.toggle('hidden', !isTeacherView);
+    document.getElementById('studentView').classList.toggle('hidden', isTeacherView);
+
+    if (isTeacherView) {
+      renderTeacherAssignments();
+      renderSettingsForm();
+      loadTeacherDashboard();
+    } else {
+      renderStudentAll();
+    }
+  }
+
+  // ==========================================
+  // 登入驗證動作
+  // ==========================================
+
+  function handleSendOtp() {
+    const email = document.getElementById('otpEmail').value.trim();
+    const btn = document.getElementById('sendOtpBtn');
+    btn.disabled = true;
+    btn.textContent = '寄送中...';
+    hideAuthError();
+
+    google.script.run
+      .withSuccessHandler(function (res) {
+        btn.disabled = false;
+        btn.textContent = '重新寄送驗證碼';
+        document.getElementById('otpVerifyBox').classList.remove('hidden');
+        alert(res.message);
+      })
+      .withFailureHandler(function (err) {
+        btn.disabled = false;
+        btn.textContent = '寄送 6 位數驗證碼';
+        showAuthError(err.message);
+      })
+      .requestEmailOtp(email);
+  }
+
+  function handleVerifyOtp() {
+    const email = document.getElementById('otpEmail').value.trim();
+    const code = document.getElementById('otpCode').value.trim();
+    const btn = document.getElementById('verifyOtpBtn');
+    btn.disabled = true;
+    hideAuthError();
+
+    google.script.run
+      .withSuccessHandler(function (res) {
+        btn.disabled = false;
+        sessionStorage.setItem(SESSION_KEY, res.sessionToken);
+        loadInitData();
+      })
+      .withFailureHandler(function (err) {
+        btn.disabled = false;
+        showAuthError(err.message);
+      })
+      .verifyEmailOtp(email, code);
+  }
+
+  function logoutSession() {
+    sessionStorage.removeItem(SESSION_KEY);
+    appState.user = null;
+    appState.viewMode = 'auto';
+    onInitSuccess({
+      authenticated: false,
+      authRelayUrl: appState.authRelayUrl
+    });
+  }
+
+  function showAuthError(msg) {
+    const box = document.getElementById('authErrorBox');
+    box.textContent = msg;
+    box.classList.remove('hidden');
+  }
+
+  function hideAuthError() {
+    document.getElementById('authErrorBox').classList.add('hidden');
+  }
+
+  // ==========================================
+  // 教師端功能
+  // ==========================================
+
+  function switchTeacherTab(tab) {
+    document.querySelectorAll('#teacherTabs .tab-btn').forEach(function (b) {
+      b.classList.toggle('active', b.dataset.tab === tab);
+    });
+    ['dashboard', 'manage', 'players', 'settings'].forEach(function (t) {
+      document.getElementById('teacherTab-' + t).classList.toggle('hidden', t !== tab);
+    });
+  }
+
+  function switchTeacherSubTab(panel, btnEl) {
+    btnEl.parentElement.querySelectorAll('.tab-btn').forEach(function (b) { b.classList.remove('active'); });
+    btnEl.classList.add('active');
+    document.getElementById('teacherSummaryPanel').classList.toggle('hidden', panel !== 'summary');
+    document.getElementById('teacherAllPanel').classList.toggle('hidden', panel !== 'all');
+  }
+
+  function renderTeacherAssignments() {
+    const sel = document.getElementById('teacherAssignmentFilter');
+    const prevVal = sel.value;
+    let html = '<option value="">全部任務</option>';
+    appState.assignments.forEach(function (a) {
+      html += '<option value="' + escapeHtml(a.assignmentId) + '">' +
+        escapeHtml(a.title) + (a.isActive ? '' : '（已關閉）') + '</option>';
+    });
+    sel.innerHTML = html;
+    if (prevVal) sel.value = prevVal;
+
+    const listEl = document.getElementById('teacherAsgList');
+    if (appState.assignments.length === 0) {
+      listEl.innerHTML = '<p class="muted">目前尚無任務，請由左側表單建立。</p>';
+      return;
+    }
+
+    listEl.innerHTML = appState.assignments.map(function (a) {
+      const badge = a.isActive
+        ? '<span class="badge badge-active">開放中</span>'
+        : '<span class="badge badge-closed">已關閉</span>';
+      return '<div style="border:1px solid var(--border);border-radius:8px;padding:12px;margin-bottom:10px;">' +
+        '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;">' +
+        '<strong>' + escapeHtml(a.title) + '</strong>' +
+        '<span>' + questTypeBadge(a) + ' ' + badge + '</span>' +
+        '</div>' +
+        '<div class="muted" style="margin:4px 0;"><span class="stars">' + stars(a.difficulty) + '</span> · 滿分 ' + a.maxScore +
+        ' 分 · <span class="xp-tag">' + a.xpReward + ' XP</span></div>' +
+        competencyChips(a) +
+        '<button class="btn btn-secondary btn-sm" style="margin-top:8px;" onclick="editAssignment(\'' + escapeHtml(a.assignmentId) + '\')">編輯此任務</button>' +
+        '</div>';
+    }).join('');
+  }
+
+  function editAssignment(id) {
+    const a = appState.assignments.find(function (item) { return item.assignmentId === id; });
+    if (!a) return;
+    document.getElementById('asgFormTitle').textContent = '編輯任務';
+    document.getElementById('editAssignmentId').value = a.assignmentId;
+    document.getElementById('asgTitle').value = a.title;
+    document.getElementById('asgDesc').value = a.description;
+    document.getElementById('asgRubric').value = a.rubric;
+    document.getElementById('asgCompetencies').value = a.competenciesText || '';
+    document.getElementById('asgMaxScore').value = a.maxScore;
+    document.getElementById('asgXpReward').value = a.xpReward;
+    document.getElementById('asgDifficulty').value = String(a.difficulty);
+    document.getElementById('asgQuestType').value = a.questType;
+    document.getElementById('asgStatus').value = a.isActive ? 'true' : 'false';
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  }
+
+  function resetAssignmentForm() {
+    document.getElementById('asgFormTitle').textContent = '建立新任務';
+    document.getElementById('editAssignmentId').value = '';
+    document.getElementById('asgTitle').value = '';
+    document.getElementById('asgDesc').value = '';
+    document.getElementById('asgRubric').value = '';
+    document.getElementById('asgCompetencies').value = '';
+    document.getElementById('asgMaxScore').value = 100;
+    document.getElementById('asgXpReward').value = 100;
+    document.getElementById('asgDifficulty').value = '1';
+    document.getElementById('asgQuestType').value = 'main';
+    document.getElementById('asgStatus').value = 'true';
+  }
+
+  function handleSaveAssignment() {
+    const btn = document.getElementById('saveAsgBtn');
+    const payload = {
+      assignmentId: document.getElementById('editAssignmentId').value,
+      title: document.getElementById('asgTitle').value,
+      description: document.getElementById('asgDesc').value,
+      rubric: document.getElementById('asgRubric').value,
+      competencies: document.getElementById('asgCompetencies').value,
+      maxScore: Number(document.getElementById('asgMaxScore').value) || 100,
+      xpReward: Number(document.getElementById('asgXpReward').value),
+      difficulty: Number(document.getElementById('asgDifficulty').value) || 1,
+      questType: document.getElementById('asgQuestType').value,
+      isActive: document.getElementById('asgStatus').value === 'true'
+    };
+
+    btn.disabled = true;
+    btn.textContent = '儲存中...';
+
+    google.script.run
+      .withSuccessHandler(function (res) {
+        btn.disabled = false;
+        btn.textContent = '儲存任務';
+        appState.assignments = res.assignments;
+        resetAssignmentForm();
+        renderTeacherAssignments();
+        alert('任務儲存成功！');
+      })
+      .withFailureHandler(function (err) {
+        btn.disabled = false;
+        btn.textContent = '儲存任務';
+        alert('儲存失敗：' + err.message);
+      })
+      .saveAssignment(token_(), payload);
+  }
+
+  function loadTeacherDashboard() {
+    const filterId = document.getElementById('teacherAssignmentFilter').value;
+    document.getElementById('teacherStats').textContent = '資料讀取中...';
+
+    google.script.run
+      .withSuccessHandler(function (res) {
+        appState.teacherData = res;
+        if (res.settings) appState.settings = res.settings;
+        renderTeacherTables();
+        renderTeacherPlayers();
+      })
+      .withFailureHandler(function (err) {
+        document.getElementById('teacherStats').textContent = '讀取失敗：' + err.message;
+      })
+      .getTeacherDashboardData(token_(), filterId);
+  }
+
+  function nicknameOf_(email) {
+    const p = (appState.teacherData.playerSummaries || []).find(function (x) { return x.studentEmail === email; });
+    return p ? p.nickname : '';
+  }
+
+  function renderTeacherTables() {
+    const summaries = appState.teacherData.studentSummaries || [];
+    const allSubs = appState.teacherData.allSubmissions || [];
+
+    const validScores = summaries
+      .map(function (s) { return s.latestSubmission ? s.latestSubmission.aiScore : null; })
+      .filter(function (v) { return v !== null && !isNaN(v); });
+    const avg = validScores.length
+      ? (validScores.reduce(function (a, b) { return a + b; }, 0) / validScores.length).toFixed(1)
+      : '-';
+
+    document.getElementById('teacherStats').innerHTML =
+      '已繳交人次（依任務與學生分組）：<strong>' + summaries.length + '</strong> ｜ ' +
+      '總繳交筆數：<strong>' + allSubs.length + '</strong> ｜ ' +
+      '採計平均成績：<strong>' + avg + '</strong>';
+
+    const sumBody = document.getElementById('teacherSummaryBody');
+    if (summaries.length === 0) {
+      sumBody.innerHTML = '<tr><td colspan="7" class="muted">目前尚無學生繳交紀錄。</td></tr>';
+    } else {
+      sumBody.innerHTML = summaries.map(function (item) {
+        const latest = item.latestSubmission || {};
+        return '<tr>' +
+          '<td><strong>' + escapeHtml(item.studentEmail) + '</strong>' +
+          '<br><span class="muted">' + escapeHtml(nicknameOf_(item.studentEmail)) + ' · ' + escapeHtml(getAssignmentTitle_(item.assignmentId)) + '</span></td>' +
+          '<td>第 ' + item.totalAttempts + ' 次</td>' +
+          '<td>' + formatTime(latest.submittedAt) + '</td>' +
+          '<td><strong style="color:var(--primary);font-size:1.05rem;">' + (latest.aiScore !== null && latest.aiScore !== undefined ? latest.aiScore : '-') + '</strong></td>' +
+          '<td class="xp-tag">' + (latest.xpEarned !== null && latest.xpEarned !== undefined ? latest.xpEarned : '-') + '</td>' +
+          '<td style="max-width:260px;">' + escapeHtml((latest.aiFeedback || '').slice(0, 75)) + '...</td>' +
+          '<td><button class="btn btn-secondary btn-sm" onclick="openSubmissionModal(\'' + escapeHtml(latest.submissionId) + '\', true)">檢視 / 重評</button></td>' +
+          '</tr>';
+      }).join('');
+    }
+
+    const allBody = document.getElementById('teacherAllBody');
+    if (allSubs.length === 0) {
+      allBody.innerHTML = '<tr><td colspan="7" class="muted">目前尚無任何繳交明細。</td></tr>';
+    } else {
+      allBody.innerHTML = allSubs.map(function (s) {
+        const badge = s.isLatest
+          ? '<span class="badge badge-latest">採計成績</span>'
+          : '<span class="badge badge-old">歷史紀錄</span>';
+        return '<tr>' +
+          '<td>' + badge + '</td>' +
+          '<td>' + escapeHtml(s.studentEmail) + '<br><span class="muted">' + escapeHtml(getAssignmentTitle_(s.assignmentId)) + '</span></td>' +
+          '<td>#' + s.attemptNumber + '</td>' +
+          '<td>' + formatTime(s.submittedAt) + '</td>' +
+          '<td>' + escapeHtml(s.fileNames || '（純文字）') + '</td>' +
+          '<td><strong>' + (s.aiScore !== null ? s.aiScore : '-') + '</strong></td>' +
+          '<td><button class="btn btn-secondary btn-sm" onclick="openSubmissionModal(\'' + escapeHtml(s.submissionId) + '\', true)">檢視詳情</button></td>' +
+          '</tr>';
+      }).join('');
+    }
+  }
+
+  function renderTeacherPlayers() {
+    const body = document.getElementById('teacherPlayersBody');
+    const list = appState.teacherData.playerSummaries || [];
+    if (list.length === 0) {
+      body.innerHTML = '<tr><td colspan="5" class="muted">目前尚無冒險者紀錄。</td></tr>';
+      return;
+    }
+    body.innerHTML = list.map(function (p) {
+      const statText = Object.keys(p.stats).sort(function (a, b) { return p.stats[b] - p.stats[a]; })
+        .map(function (k) { return escapeHtml(k) + ' ' + p.stats[k]; }).join('、') || '<span class="muted">—</span>';
+      return '<tr>' +
+        '<td><strong>' + escapeHtml(p.nickname) + '</strong>' + (p.isTeacher ? ' <span class="badge badge-teacher">教師</span>' : '') +
+        '<br><span class="muted">' + escapeHtml(p.studentEmail) + '</span></td>' +
+        '<td><span class="badge badge-gold">Lv ' + p.level + '</span> ' + escapeHtml(p.title) + '</td>' +
+        '<td class="xp-tag">' + p.totalXp + '</td>' +
+        '<td style="max-width:320px;">' + statText + '</td>' +
+        '<td>' + badgeIcons(p.badges) + '</td>' +
+        '</tr>';
+    }).join('');
+  }
+
+  function exportTeacherCsv() {
+    const summaries = appState.teacherData.studentSummaries || [];
+    if (summaries.length === 0) {
+      alert('目前沒有可匯出的資料。');
+      return;
+    }
+    const rows = [['任務名稱', '學生Email', '暱稱', '繳交次數', '最後繳交時間', '採計成績', 'XP', '能力評價', 'AI評分理由', 'AI回饋', '導師評語']];
+    summaries.forEach(function (item) {
+      const s = item.latestSubmission || {};
+      rows.push([
+        getAssignmentTitle_(item.assignmentId),
+        item.studentEmail,
+        nicknameOf_(item.studentEmail),
+        item.totalAttempts,
+        formatTime(s.submittedAt),
+        s.aiScore !== null && s.aiScore !== undefined ? s.aiScore : '',
+        s.xpEarned !== null && s.xpEarned !== undefined ? s.xpEarned : '',
+        (s.competencyResults || []).map(function (c) { return c.name + ':' + c.rating; }).join('; '),
+        s.aiReasoning || '',
+        s.aiFeedback || '',
+        s.mentorComment || ''
+      ]);
+    });
+
+    const csv = '﻿' + rows.map(function (r) {
+      return r.map(function (cell) {
+        return '"' + String(cell).replace(/"/g, '""') + '"';
+      }).join(',');
+    }).join('\n');
+
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = '任務成績總覽_' + new Date().toISOString().slice(0, 10) + '.csv';
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  function renderSettingsForm() {
+    document.getElementById('setLeaderboard').checked = appState.settings.leaderboardEnabled !== false;
+    document.getElementById('setPersona').value = appState.settings.mentorPersona || '';
+  }
+
+  function handleSaveSettings() {
+    const btn = document.getElementById('saveSettingsBtn');
+    btn.disabled = true;
+    btn.textContent = '儲存中...';
+    google.script.run
+      .withSuccessHandler(function (res) {
+        btn.disabled = false;
+        btn.textContent = '儲存設定';
+        appState.settings = res.settings;
+        renderSettingsForm();
+        alert('遊戲設定已儲存！學生重新整理頁面後生效。');
+      })
+      .withFailureHandler(function (err) {
+        btn.disabled = false;
+        btn.textContent = '儲存設定';
+        alert('儲存失敗：' + err.message);
+      })
+      .saveGameSettings(token_(), {
+        leaderboardEnabled: document.getElementById('setLeaderboard').checked,
+        mentorPersona: document.getElementById('setPersona').value
+      });
+  }
+
+  // ==========================================
+  // 學生端：角色卡、任務板、成就、排行榜、紀錄
+  // ==========================================
+
+  function renderStudentAll() {
+    renderHeroCard();
+    renderQuestBoard();
+    renderBadgeWall();
+    renderLeaderboard();
+    renderAllHistory();
+    if (appState.currentQuestId) openQuest(appState.currentQuestId);
+  }
+
+  function switchStudentTab(tab) {
+    document.querySelectorAll('#studentTabs .tab-btn').forEach(function (b) {
+      b.classList.toggle('active', b.dataset.tab === tab);
+    });
+    ['quests', 'badges', 'leaderboard', 'history'].forEach(function (t) {
+      document.getElementById('studentTab-' + t).classList.toggle('hidden', t !== tab);
+    });
+  }
+
+  function heroAvatar(level) {
+    if (level >= 16) return '🐉';
+    if (level >= 12) return '🦸';
+    if (level >= 8) return '🧙';
+    if (level >= 5) return '🛡️';
+    if (level >= 3) return '🏹';
+    return '🧑‍🎓';
+  }
+
+  function renderHeroCard() {
+    const p = appState.profile;
+    if (!p) return;
+    const inLevel = p.totalXp - p.levelFloorXp;
+    const need = p.nextLevelXp - p.levelFloorXp;
+    const pct = Math.round(Math.max(0, Math.min(1, p.progress)) * 100);
+    const completed = Object.keys(p.quests).length;
+
+    document.getElementById('heroCard').innerHTML =
+      '<div>' +
+      '<div class="hero-top">' +
+      '<div class="hero-avatar">' + heroAvatar(p.level) + '</div>' +
+      '<div>' +
+      '<div class="hero-name">' + escapeHtml(appState.nickname) +
+      ' <button class="btn-link" onclick="handleEditNickname()">✏️ 改暱稱</button></div>' +
+      '<div><span class="hero-level">Lv ' + p.level + '</span><span class="hero-title">' + escapeHtml(p.title) + '</span></div>' +
+      '</div>' +
+      '</div>' +
+      '<div class="xp-bar"><div class="xp-fill" style="width:' + pct + '%;"></div></div>' +
+      '<div class="xp-text">XP ' + inLevel + ' / ' + need + '（總計 ' + p.totalXp + ' XP，距離 Lv ' + (p.level + 1) + ' 還差 ' + (p.nextLevelXp - p.totalXp) + '）</div>' +
+      '<div class="hero-meta">' +
+      '<span>完成任務 <strong>' + completed + '</strong></span>' +
+      '<span>獲得徽章 <strong>' + p.badges.length + '</strong> / ' + appState.badgeCatalog.length + '</span>' +
+      '<span>' + badgeIcons(p.badges) + '</span>' +
+      '</div>' +
+      '</div>' +
+      '<div class="radar-wrap">' + renderStats(p.stats) + '</div>';
+  }
+
+  /** 3 項以上能力畫雷達圖，否則畫長條 */
+  function renderStats(stats) {
+    const names = Object.keys(stats);
+    if (names.length === 0) {
+      return '<div style="opacity:0.8;font-size:0.9rem;">完成任務後，<br>這裡會長出你的能力雷達圖 ✨</div>';
+    }
+    const maxVal = Math.max(50, Math.max.apply(null, names.map(function (n) { return stats[n]; })));
+    if (names.length < 3) {
+      return '<div class="stat-list">' + names.map(function (n) {
+        return '<div class="stat-row"><span>' + escapeHtml(n) + '</span>' +
+          '<div class="stat-track"><div class="stat-fill" style="width:' + Math.round(stats[n] / maxVal * 100) + '%;"></div></div>' +
+          '<span>' + stats[n] + '</span></div>';
+      }).join('') + '</div>';
+    }
+
+    const shown = names.slice(0, 8); // 最多畫 8 軸
+    const cx = 130, cy = 120, r = 80;
+    const n = shown.length;
+    function pt(i, ratio) {
+      const ang = -Math.PI / 2 + i * 2 * Math.PI / n;
+      return [cx + Math.cos(ang) * r * ratio, cy + Math.sin(ang) * r * ratio];
+    }
+    let svg = '<svg viewBox="0 0 260 240" xmlns="http://www.w3.org/2000/svg">';
+    [0.25, 0.5, 0.75, 1].forEach(function (lv) {
+      const poly = shown.map(function (_, i) { return pt(i, lv).join(','); }).join(' ');
+      svg += '<polygon points="' + poly + '" fill="none" stroke="rgba(255,255,255,0.25)" stroke-width="1"/>';
+    });
+    shown.forEach(function (_, i) {
+      const e = pt(i, 1);
+      svg += '<line x1="' + cx + '" y1="' + cy + '" x2="' + e[0] + '" y2="' + e[1] + '" stroke="rgba(255,255,255,0.2)"/>';
+    });
+    const dataPoly = shown.map(function (name, i) { return pt(i, stats[name] / maxVal).join(','); }).join(' ');
+    svg += '<polygon points="' + dataPoly + '" fill="rgba(251,191,36,0.45)" stroke="#fbbf24" stroke-width="2"/>';
+    shown.forEach(function (name, i) {
+      const lp = pt(i, 1.22);
+      const anchor = Math.abs(lp[0] - cx) < 5 ? 'middle' : (lp[0] > cx ? 'start' : 'end');
+      svg += '<text x="' + lp[0] + '" y="' + (lp[1] + 4) + '" fill="#fff" font-size="10" text-anchor="' + anchor + '">' +
+        escapeHtml(name.length > 6 ? name.slice(0, 6) + '…' : name) + ' ' + stats[name] + '</text>';
+    });
+    svg += '</svg>';
+    return svg;
+  }
+
+  function handleEditNickname() {
+    const next = prompt('輸入新的暱稱（1–20 字，會顯示在排行榜上）', appState.nickname);
+    if (next === null) return;
+    google.script.run
+      .withSuccessHandler(function (res) {
+        appState.nickname = res.nickname;
+        renderHeroCard();
+        loadInitData(); // 重新取得排行榜
+      })
+      .withFailureHandler(function (err) { alert('修改失敗：' + err.message); })
+      .updateNickname(token_(), next);
+  }
+
+  function renderQuestBoard() {
+    const board = document.getElementById('questBoard');
+    const p = appState.profile || { quests: {} };
+    if (appState.assignments.length === 0) {
+      board.innerHTML = '<div class="card muted">目前還沒有任務，請等待教師發布。</div>';
+      return;
+    }
+    // 主線在前，開放中在前
+    const list = appState.assignments.slice().sort(function (a, b) {
+      if (a.isActive !== b.isActive) return a.isActive ? -1 : 1;
+      if (a.questType !== b.questType) return a.questType === 'main' ? -1 : 1;
+      return 0;
+    });
+    board.innerHTML = list.map(function (a) {
+      const q = p.quests[a.assignmentId];
+      let cls = 'quest-card';
+      let status = '<span class="muted">未挑戰</span>';
+      if (q && q.status === 'perfect') { cls += ' perfect'; status = '<span class="badge badge-gold">💎 滿分通關</span>'; }
+      else if (q) { cls += ' done'; status = '<span class="badge badge-latest">✔ 已完成 ' + q.score + ' 分</span>'; }
+      if (!a.isActive) cls += ' closed';
+      return '<div class="' + cls + '" onclick="openQuest(\'' + escapeHtml(a.assignmentId) + '\')">' +
+        '<div class="quest-head"><div class="quest-title">' + escapeHtml(a.title) + '</div>' + questTypeBadge(a) + '</div>' +
+        '<div class="stars">' + stars(a.difficulty) + '</div>' +
+        competencyChips(a) +
+        '<div class="quest-foot">' +
+        '<span class="xp-tag">' + (q ? q.xp + ' / ' : '') + a.xpReward + ' XP</span>' +
+        (a.isActive ? status : '<span class="badge badge-closed">已關閉</span>') +
+        '</div>' +
+        '</div>';
+    }).join('');
+  }
+
+  function openQuest(assignmentId) {
+    const asg = appState.assignments.find(function (a) { return a.assignmentId === assignmentId; });
+    if (!asg) { closeQuest(); return; }
+    if (appState.currentQuestId !== assignmentId) {
+      document.getElementById('studentTextAnswer').value = '';
+      appState.selectedFiles = [];
+      renderSelectedFiles();
+    }
+    appState.currentQuestId = assignmentId;
+    document.getElementById('questBoard').classList.add('hidden');
+    document.getElementById('questDetail').classList.remove('hidden');
+
+    const canSubmit = asg.isActive || appState.user.isTeacher;
+    document.getElementById('submissionFormWrap').classList.toggle('hidden', !canSubmit);
+
+    const compList = asg.competencies.length
+      ? '<strong>可培養的能力</strong><div class="chips" style="margin:6px 0 10px;">' +
+        asg.competencies.map(function (c) { return '<span class="chip">' + escapeHtml(c.name) + ' ×' + c.weight + '</span>'; }).join('') +
+        '</div>'
+      : '';
+
+    document.getElementById('questInfo').innerHTML =
+      '<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;">' +
+      '<h2 style="margin:0;">' + escapeHtml(asg.title) + '</h2>' + questTypeBadge(asg) +
+      '</div>' +
+      '<div style="margin:6px 0 12px;"><span class="stars">' + stars(asg.difficulty) + '</span> · 滿分 ' + asg.maxScore +
+      ' 分 · <span class="xp-tag">最高 ' + asg.xpReward + ' XP</span> · ' +
+      (asg.isActive ? '<span class="badge badge-active">開放挑戰中</span>' : '<span class="badge badge-closed">已關閉</span>') +
+      '</div>' +
+      compList +
+      '<strong>任務說明</strong>' +
+      '<p style="white-space:pre-wrap;margin:6px 0 12px;">' + escapeHtml(asg.description || '無額外說明') + '</p>' +
+      '<strong>評分標準</strong>' +
+      '<p style="white-space:pre-wrap;margin:6px 0 0;color:#44403c;">' + escapeHtml(asg.rubric) + '</p>';
+
+    renderStudentSubmissionsForAssignment(asg);
+  }
+
+  function closeQuest() {
+    appState.currentQuestId = '';
+    document.getElementById('questDetail').classList.add('hidden');
+    document.getElementById('questBoard').classList.remove('hidden');
+  }
+
+  function renderStudentSubmissionsForAssignment(asg) {
+    const list = appState.mySubmissions.filter(function (s) { return s.assignmentId === asg.assignmentId; });
+    const latestPanel = document.getElementById('studentLatestGradePanel');
+    const historyPanel = document.getElementById('studentHistoryPanel');
+
+    if (list.length === 0) {
+      latestPanel.innerHTML = '<p class="muted">您尚未挑戰此任務。</p>';
+      historyPanel.innerHTML = '<p class="muted">尚無挑戰紀錄。</p>';
+      return;
+    }
+
+    const latest = list.find(function (s) { return s.isLatest; }) || list[0];
+    latestPanel.innerHTML =
+      '<div class="score-box">' +
+      '<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px;">' +
+      '<span class="badge badge-latest">採計（第 ' + latest.attemptNumber + ' 次挑戰）</span>' +
+      '<span class="muted">' + formatTime(latest.submittedAt) + '</span>' +
+      '</div>' +
+      '<div class="score-big" style="margin:8px 0;">' + latest.aiScore +
+      ' <span style="font-size:1rem;font-weight:500;color:#78716c;">/ ' + asg.maxScore + ' 分</span>' +
+      ' <span class="xp-tag" style="font-size:1rem;">+' + (latest.xpEarned !== null ? latest.xpEarned : 0) + ' XP</span></div>' +
+      mentorBox(latest.mentorComment) +
+      competencyBars(latest.competencyResults) +
+      '<p style="margin:10px 0 6px;"><strong>評分理由：</strong><br><span style="white-space:pre-wrap;">' + escapeHtml(latest.aiReasoning) + '</span></p>' +
+      '<p style="margin:10px 0 0;"><strong>AI 回饋：</strong><br><span style="white-space:pre-wrap;">' + escapeHtml(latest.aiFeedback) + '</span></p>' +
+      '</div>';
+
+    historyPanel.innerHTML = list.map(historyItem).join('');
+  }
+
+  function historyItem(s) {
+    const badge = s.isLatest
+      ? '<span class="badge badge-latest">採計</span>'
+      : '<span class="badge badge-old">歷史紀錄</span>';
+    return '<div style="border:1px solid var(--border);border-radius:8px;padding:10px 12px;margin-bottom:8px;display:flex;justify-content:space-between;align-items:center;gap:10px;">' +
+      '<div>' +
+      '<strong>' + escapeHtml(getAssignmentTitle_(s.assignmentId)) + '</strong> · 第 ' + s.attemptNumber + ' 次 ' + badge +
+      '<div class="muted">' + formatTime(s.submittedAt) + ' · 分數：<strong>' + s.aiScore + '</strong>' +
+      (s.xpEarned !== null ? ' · <span class="xp-tag">' + s.xpEarned + ' XP</span>' : '') + '</div>' +
+      '<div class="muted">檔案：' + escapeHtml(s.fileNames || '（純文字）') + '</div>' +
+      '</div>' +
+      '<button class="btn btn-secondary btn-sm" onclick="openSubmissionModal(\'' + escapeHtml(s.submissionId) + '\', false)">檢視</button>' +
+      '</div>';
+  }
+
+  function renderBadgeWall() {
+    const owned = (appState.profile && appState.profile.badges) || [];
+    document.getElementById('badgeWall').innerHTML = appState.badgeCatalog.map(function (b) {
+      const has = owned.indexOf(b.id) !== -1;
+      return '<div class="badge-tile ' + (has ? 'unlocked' : 'locked') + '">' +
+        '<div class="icon">' + b.icon + '</div>' +
+        '<div><strong>' + escapeHtml(b.name) + '</strong></div>' +
+        '<div class="muted">' + escapeHtml(b.desc) + '</div>' +
+        '<div class="muted" style="margin-top:4px;">' + (has ? '✔ 已解鎖' : '🔒 未解鎖') + '</div>' +
+        '</div>';
+    }).join('');
+  }
+
+  function renderLeaderboard() {
+    const enabled = Array.isArray(appState.leaderboard);
+    document.getElementById('leaderboardTabBtn').classList.toggle('hidden', !enabled);
+    if (!enabled) {
+      if (!document.getElementById('studentTab-leaderboard').classList.contains('hidden')) switchStudentTab('quests');
+      return;
+    }
+    const body = document.getElementById('leaderboardBody');
+    if (appState.leaderboard.length === 0) {
+      body.innerHTML = '<tr><td colspan="5" class="muted">還沒有冒險者上榜，快去完成第一個任務吧！</td></tr>';
+      return;
+    }
+    const medals = { 1: '🥇', 2: '🥈', 3: '🥉' };
+    body.innerHTML = appState.leaderboard.map(function (r) {
+      return '<tr class="' + (r.isMe ? 'me-row' : '') + '">' +
+        '<td>' + (medals[r.rank] || r.rank) + '</td>' +
+        '<td>' + escapeHtml(r.nickname) + (r.isMe ? '（你）' : '') + '</td>' +
+        '<td><span class="badge badge-gold">Lv ' + r.level + '</span> ' + escapeHtml(r.title) + '</td>' +
+        '<td class="xp-tag">' + r.totalXp + '</td>' +
+        '<td>' + r.badgeCount + '</td>' +
+        '</tr>';
+    }).join('');
+  }
+
+  function renderAllHistory() {
+    const el = document.getElementById('allHistoryPanel');
+    el.innerHTML = appState.mySubmissions.length
+      ? appState.mySubmissions.map(historyItem).join('')
+      : '<p class="muted">尚無任何挑戰紀錄。</p>';
+  }
+
+  // ==========================================
+  // 檔案讀取（沿用 ai-grading-gas）
+  // ==========================================
+
+  function setupFileEvents() {
+    const fileInput = document.getElementById('fileInput');
+    const dropZone = document.getElementById('dropZone');
+
+    fileInput.addEventListener('change', function (e) {
+      handleFilesSelected(e.target.files);
+      fileInput.value = '';
+    });
+
+    dropZone.addEventListener('dragover', function (e) {
+      e.preventDefault();
+      dropZone.classList.add('dragover');
+    });
+    dropZone.addEventListener('dragleave', function () {
+      dropZone.classList.remove('dragover');
+    });
+    dropZone.addEventListener('drop', function (e) {
+      e.preventDefault();
+      dropZone.classList.remove('dragover');
+      handleFilesSelected(e.dataTransfer.files);
+    });
+  }
+
+  function handleFilesSelected(fileList) {
+    Array.from(fileList).forEach(function (file) {
+      const ext = (file.name.split('.').pop() || '').toLowerCase();
+      if (!ALLOWED_EXT.has(ext) && !file.type.startsWith('text/')) {
+        alert('檔案「' + file.name + '」不是支援的純文字或程式碼格式。');
+        return;
+      }
+      if (file.size > 2 * 1024 * 1024) {
+        alert('檔案「' + file.name + '」超過 2MB，請精簡後再上傳。');
+        return;
+      }
+
+      const reader = new FileReader();
+      reader.onload = function (evt) {
+        let text = String(evt.target.result || '');
+        if (text.indexOf('\u0000') !== -1) {
+          alert('檔案「' + file.name + '」偵測到二進位內容，無法以純文字方式儲存。');
+          return;
+        }
+        if (ext === 'ipynb') {
+          text = sanitizeIpynbText(text);
+        }
+        appState.selectedFiles.push({ name: file.name, content: text });
+        renderSelectedFiles();
+      };
+      reader.readAsText(file, 'UTF-8');
+    });
+  }
+
+  // 針對 Jupyter Notebook (.ipynb) 移除過大的圖片 Base64 輸出，保留所有程式碼與文字
+  function sanitizeIpynbText(rawText) {
+    try {
+      const nb = JSON.parse(rawText);
+      if (Array.isArray(nb.cells)) {
+        nb.cells.forEach(function (cell) {
+          if (Array.isArray(cell.outputs)) {
+            cell.outputs.forEach(function (out) {
+              if (out.data) {
+                Object.keys(out.data).forEach(function (mime) {
+                  if (mime.indexOf('image/') === 0) {
+                    out.data[mime] = '[已略過內嵌圖片 Base64 以符合試算表儲存限制]';
+                  }
+                });
+              }
+            });
+          }
+        });
+      }
+      return JSON.stringify(nb, null, 2);
+    } catch (e) {
+      return rawText;
+    }
+  }
+
+  function renderSelectedFiles() {
+    const el = document.getElementById('selectedFilesList');
+    el.innerHTML = appState.selectedFiles.map(function (f, idx) {
+      return '<div class="file-item">' +
+        '<span>' + escapeHtml(f.name) + ' <span class="muted">(' + f.content.length + ' 字元)</span></span>' +
+        '<button class="btn btn-secondary btn-sm" onclick="removeSelectedFile(' + idx + ')">移除</button>' +
+        '</div>';
+    }).join('');
+  }
+
+  function removeSelectedFile(idx) {
+    appState.selectedFiles.splice(idx, 1);
+    renderSelectedFiles();
+  }
+
+  // ==========================================
+  // 送出挑戰與結算畫面
+  // ==========================================
+
+  function handleSubmitHomework() {
+    const asgId = appState.currentQuestId;
+    const textContent = document.getElementById('studentTextAnswer').value;
+
+    if (!asgId) {
+      alert('請先選擇任務。');
+      return;
+    }
+    if (!textContent.trim() && appState.selectedFiles.length === 0) {
+      alert('請填寫作業文字內容，或上傳至少一份文字檔案。');
+      return;
+    }
+
+    const btn = document.getElementById('submitHomeworkBtn');
+    btn.disabled = true;
+    btn.textContent = '🔮 導師正在依評分標準批改中，請稍候...';
+
+    google.script.run
+      .withSuccessHandler(function (res) {
+        btn.disabled = false;
+        btn.textContent = '⚔️ 送出挑戰，接受 AI 評分';
+        appState.mySubmissions = res.mySubmissions;
+        appState.profile = res.profile;
+        if (res.leaderboard !== undefined) appState.leaderboard = res.leaderboard;
+        document.getElementById('studentTextAnswer').value = '';
+        appState.selectedFiles = [];
+        renderSelectedFiles();
+        renderStudentAll();
+        openResultModal(res);
+      })
+      .withFailureHandler(function (err) {
+        btn.disabled = false;
+        btn.textContent = '⚔️ 送出挑戰，接受 AI 評分';
+        alert('繳交失敗：' + err.message);
+      })
+      .submitAssignment(token_(), {
+        assignmentId: asgId,
+        textContent: textContent,
+        files: appState.selectedFiles
+      });
+  }
+
+  function openResultModal(res) {
+    const s = res.submission;
+    const r = res.result;
+    const asg = appState.assignments.find(function (a) { return a.assignmentId === s.assignmentId; }) || { maxScore: 100 };
+
+    const xpLine = r.xpDelta > 0
+      ? '+' + r.xpDelta + ' XP'
+      : (r.xpDelta < 0 ? r.xpDelta + ' XP' : '±0 XP');
+    const xpNote = s.attemptNumber > 1
+      ? '<div class="muted">本次挑戰 ' + s.xpEarned + ' XP；重新挑戰只採計最後一次，上方為總 XP 的變化</div>'
+      : '';
+
+    const levelUp = r.levelAfter > r.levelBefore
+      ? '<div class="level-up">🎉 升級！Lv ' + r.levelBefore + ' → Lv ' + r.levelAfter + '　' + escapeHtml(r.titleAfter) + '</div>'
+      : '';
+
+    const statLines = r.statDeltas.length
+      ? '<h4 style="margin:14px 0 6px;">能力值變化</h4>' + r.statDeltas.map(function (d) {
+          const cls = d.delta > 0 ? 'delta-up' : 'delta-down';
+          return '<div>' + escapeHtml(d.name) + '：' + d.value + ' <span class="' + cls + '">(' + (d.delta > 0 ? '+' : '') + d.delta + ')</span></div>';
+        }).join('')
+      : '';
+
+    const badgeLines = r.newBadges.length
+      ? '<h4 style="margin:14px 0 6px;">解鎖新徽章！</h4><div class="badge-wall">' + r.newBadges.map(function (b) {
+          return '<div class="badge-tile unlocked"><div class="icon">' + b.icon + '</div><strong>' + escapeHtml(b.name) + '</strong>' +
+            '<div class="muted">' + escapeHtml(b.desc) + '</div></div>';
+        }).join('') + '</div>'
+      : '';
+
+    document.getElementById('modalTitle').textContent = '任務結算 — ' + getAssignmentTitle_(s.assignmentId);
+    document.getElementById('modalBody').innerHTML =
+      '<div class="result-hero">' +
+      '<div class="score-big">' + s.aiScore + ' <span style="font-size:1rem;color:#78716c;">/ ' + asg.maxScore + ' 分</span></div>' +
+      '<div class="result-xp">' + xpLine + '</div>' + xpNote +
+      levelUp +
+      '</div>' +
+      mentorBox(s.mentorComment) +
+      competencyBars(s.competencyResults) +
+      statLines +
+      badgeLines +
+      '<h4 style="margin:16px 0 6px;">評分理由</h4><p style="white-space:pre-wrap;margin:0;">' + escapeHtml(s.aiReasoning) + '</p>' +
+      '<h4 style="margin:16px 0 6px;">AI 回饋</h4><p style="white-space:pre-wrap;margin:0;">' + escapeHtml(s.aiFeedback) + '</p>';
+
+    document.getElementById('detailModal').classList.add('open');
+  }
+
+  // ==========================================
+  // 共用 Modal 檢視與重新評分
+  // ==========================================
+
+  function openSubmissionModal(submissionId, allowRegrade) {
+    const pool = allowRegrade ? appState.teacherData.allSubmissions : appState.mySubmissions;
+    const s = pool.find(function (item) { return item.submissionId === submissionId; });
+    if (!s) return;
+
+    document.getElementById('modalTitle').textContent =
+      getAssignmentTitle_(s.assignmentId) + ' — 第 ' + s.attemptNumber + ' 次繳交';
+
+    const regradeBtn = allowRegrade
+      ? '<button class="btn btn-primary btn-sm" id="regradeBtn" onclick="handleRegrade(\'' + escapeHtml(s.submissionId) + '\')">重新以 AI 評分</button>'
+      : '';
+
+    document.getElementById('modalBody').innerHTML =
+      '<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:12px;">' +
+      '<div><strong>學生：</strong>' + escapeHtml(s.studentEmail) + ' · <span class="muted">' + formatTime(s.submittedAt) + '</span></div>' +
+      regradeBtn +
+      '</div>' +
+      '<div class="score-box">' +
+      '<div><strong>AI 評分：</strong><span style="font-size:1.4rem;font-weight:700;color:var(--primary);">' + s.aiScore + '</span>' +
+      (s.xpEarned !== null ? ' <span class="xp-tag">' + s.xpEarned + ' XP</span>' : '') +
+      ' <span class="muted">（模型：' + escapeHtml(s.modelUsed || '-') + '）</span></div>' +
+      mentorBox(s.mentorComment) +
+      competencyBars(s.competencyResults) +
+      '<p style="margin:8px 0;"><strong>評分理由：</strong><br><span style="white-space:pre-wrap;">' + escapeHtml(s.aiReasoning) + '</span></p>' +
+      '<p style="margin:8px 0 0;"><strong>評語回饋：</strong><br><span style="white-space:pre-wrap;">' + escapeHtml(s.aiFeedback) + '</span></p>' +
+      '</div>' +
+      '<h4>文字作答內容</h4>' +
+      '<div class="pre-box">' + escapeHtml(s.textContent || '（無填寫文字）') + '</div>' +
+      '<h4 style="margin-top:16px;">上傳檔案純文字內容（' + escapeHtml(s.fileNames || '無檔案') + '）</h4>' +
+      '<div class="pre-box">' + escapeHtml(s.filesFullText || '（無上傳檔案）') + '</div>';
+
+    document.getElementById('detailModal').classList.add('open');
+  }
+
+  function handleRegrade(submissionId) {
+    const btn = document.getElementById('regradeBtn');
+    btn.disabled = true;
+    btn.textContent = 'AI 重新評分中...';
+
+    google.script.run
+      .withSuccessHandler(function (res) {
+        alert('重新評分完成！新分數：' + res.score + '（' + res.xpEarned + ' XP）');
+        closeModal();
+        loadTeacherDashboard();
+      })
+      .withFailureHandler(function (err) {
+        btn.disabled = false;
+        btn.textContent = '重新以 AI 評分';
+        alert('重新評分失敗：' + err.message);
+      })
+      .regradeSubmission(token_(), submissionId);
+  }
+
+  function closeModal() {
+    document.getElementById('detailModal').classList.remove('open');
+  }
+
+  // ==========================================
+  // 共用片段與工具函式
+  // ==========================================
+
+  function stars(n) {
+    const k = Math.max(1, Math.min(5, Number(n) || 1));
+    return '★'.repeat(k) + '☆'.repeat(5 - k);
+  }
+
+  function questTypeBadge(a) {
+    return a.questType === 'side'
+      ? '<span class="badge badge-side">支線</span>'
+      : '<span class="badge badge-main">主線</span>';
+  }
+
+  function competencyChips(a) {
+    if (!a.competencies || !a.competencies.length) return '';
+    return '<div class="chips">' + a.competencies.map(function (c) {
+      return '<span class="chip">' + escapeHtml(c.name) + '</span>';
+    }).join('') + '</div>';
+  }
+
+  function competencyBars(results) {
+    if (!results || !results.length) return '';
+    return '<div style="margin:10px 0;"><strong>素養與核心能力評價</strong>' +
+      results.map(function (c) {
+        return '<div class="comp-row" title="' + escapeHtml(c.comment || '') + '">' +
+          '<span>' + escapeHtml(c.name) + '</span>' +
+          '<div class="comp-track"><div class="comp-fill" style="width:' + c.rating + '%;"></div></div>' +
+          '<span>' + c.rating + '</span></div>' +
+          (c.comment ? '<div class="muted" style="margin:-2px 0 8px;">' + escapeHtml(c.comment) + '</div>' : '');
+      }).join('') + '</div>';
+  }
+
+  function mentorBox(text) {
+    if (!text) return '';
+    return '<div class="mentor-box"><div class="icon">🧙</div><p>' + escapeHtml(text) + '</p></div>';
+  }
+
+  function badgeIcons(ids) {
+    return (ids || []).map(function (id) {
+      const b = appState.badgeCatalog.find(function (x) { return x.id === id; });
+      return b ? '<span title="' + escapeHtml(b.name) + '">' + b.icon + '</span>' : '';
+    }).join(' ');
+  }
+
+  function getAssignmentTitle_(assignmentId) {
+    const a = appState.assignments.find(function (item) { return item.assignmentId === assignmentId; });
+    return a ? a.title : assignmentId;
+  }
+
+  function formatTime(iso) {
+    if (!iso) return '';
+    const d = new Date(iso);
+    return isNaN(d.getTime()) ? iso : d.toLocaleString('zh-TW', { hour12: false });
+  }
+
+  function escapeHtml(str) {
+    return String(str == null ? '' : str)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+</script>

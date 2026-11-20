@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <base target="_top">
+  <title>AI 評分 RPG</title>
+  <?!= include('Styles'); ?>
+</head>
+<body>
+  <!-- 安全傳遞後端 Relay Token，避免 GAS scriptlet JS 引號轉義問題 -->
+  <div id="relayTokenCarrier" data-token="<?= initialRelayToken || '' ?>" class="hidden"></div>
+
+  <header>
+    <h1>⚔️ AI 評分 RPG <span style="font-size:0.78rem;font-weight:400;opacity:0.8;">Powered by Gemini</span></h1>
+    <div class="user-bar" id="userBar">
+      <span id="userStatusText">載入中...</span>
+    </div>
+  </header>
+
+  <div class="container">
+    <!-- 載入中 -->
+    <div id="loadingCard" class="card">
+      <p>正在驗證帳號並載入冒險資料，請稍候...</p>
+    </div>
+
+    <!-- 登入驗證畫面 -->
+    <div id="authCard" class="card hidden" style="max-width:480px;margin:40px auto;">
+      <h2>登入驗證</h2>
+      <p class="muted">請使用您的 Google / Email 帳號完成身份認證後開始冒險。</p>
+      <div id="authErrorBox" class="alert alert-error hidden"></div>
+
+      <div id="relayLoginSection" class="hidden" style="margin-bottom:18px;">
+        <a id="relayLoginLink" href="#" target="_top" class="btn btn-primary" style="width:100%;text-decoration:none;">
+          使用 Google 帳號一鍵登入
+        </a>
+        <div style="text-align:center;margin:14px 0;color:#a8a29e;font-size:0.85rem;">— 或使用 Email 驗證碼登入 —</div>
+      </div>
+
+      <div class="form-group">
+        <label for="otpEmail">Google / Email 信箱</label>
+        <input type="email" id="otpEmail" placeholder="example@gmail.com">
+      </div>
+      <div class="form-group">
+        <button class="btn btn-secondary" id="sendOtpBtn" onclick="handleSendOtp()">寄送 6 位數驗證碼</button>
+      </div>
+      <div id="otpVerifyBox" class="hidden">
+        <div class="form-group">
+          <label for="otpCode">輸入驗證碼</label>
+          <input type="text" id="otpCode" placeholder="請輸入信箱收到的 6 位數驗證碼">
+        </div>
+        <button class="btn btn-primary" id="verifyOtpBtn" onclick="handleVerifyOtp()">驗證並登入</button>
+      </div>
+    </div>
+
+    <!-- 主系統區域 -->
+    <div id="mainApp" class="hidden">
+      <div id="apiWarning" class="alert alert-warn hidden">
+        注意：系統尚未在指令碼屬性設定 <code>GEMINI_API_KEY</code>，AI 評分功能將無法運作。
+      </div>
+
+      <!-- ================= 教師模式 ================= -->
+      <div id="teacherView" class="hidden">
+        <div class="tabs" id="teacherTabs">
+          <button class="tab-btn active" data-tab="dashboard" onclick="switchTeacherTab('dashboard')">成績總覽與批改紀錄</button>
+          <button class="tab-btn" data-tab="manage" onclick="switchTeacherTab('manage')">任務管理（新增 / 編輯）</button>
+          <button class="tab-btn" data-tab="players" onclick="switchTeacherTab('players')">冒險者一覽</button>
+          <button class="tab-btn" data-tab="settings" onclick="switchTeacherTab('settings')">遊戲設定</button>
+        </div>
+
+        <!-- 教師分頁 1：成績與繳交紀錄 -->
+        <div id="teacherTab-dashboard">
+          <div class="card">
+            <div style="display:flex;justify-content:space-between;align-items:flex-end;gap:12px;flex-wrap:wrap;">
+              <div style="flex:1;min-width:240px;">
+                <label for="teacherAssignmentFilter">選擇檢視任務</label>
+                <select id="teacherAssignmentFilter" onchange="loadTeacherDashboard()"></select>
+              </div>
+              <div style="display:flex;gap:8px;">
+                <button class="btn btn-secondary" onclick="loadTeacherDashboard()">重新整理</button>
+                <button class="btn btn-primary" onclick="exportTeacherCsv()">匯出採計成績 CSV</button>
+              </div>
+            </div>
+            <div id="teacherStats" class="muted" style="margin-top:12px;"></div>
+          </div>
+
+          <div class="card">
+            <div class="tabs">
+              <button class="tab-btn active" onclick="switchTeacherSubTab('summary', this)">學生成績總覽（以最後一筆為準）</button>
+              <button class="tab-btn" onclick="switchTeacherSubTab('all', this)">所有繳交明細（含歷次上傳）</button>
+            </div>
+
+            <div id="teacherSummaryPanel" class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>學生</th>
+                    <th>繳交次數</th>
+                    <th>最後繳交時間</th>
+                    <th>採計成績</th>
+                    <th>XP</th>
+                    <th>AI 評語摘要</th>
+                    <th>操作</th>
+                  </tr>
+                </thead>
+                <tbody id="teacherSummaryBody"></tbody>
+              </table>
+            </div>
+
+            <div id="teacherAllPanel" class="table-wrap hidden">
+              <table>
+                <thead>
+                  <tr>
+                    <th>狀態</th>
+                    <th>學生</th>
+                    <th>次數</th>
+                    <th>繳交時間</th>
+                    <th>上傳檔案</th>
+                    <th>AI 分數</th>
+                    <th>操作</th>
+                  </tr>
+                </thead>
+                <tbody id="teacherAllBody"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <!-- 教師分頁 2：任務建立與編輯 -->
+        <div id="teacherTab-manage" class="hidden">
+          <div class="grid-2">
+            <div class="card">
+              <h3 id="asgFormTitle">建立新任務</h3>
+              <input type="hidden" id="editAssignmentId">
+              <div class="form-group">
+                <label for="asgTitle">任務（作業）標題 *</label>
+                <input type="text" id="asgTitle" placeholder="例如：第一次 Python 資料分析作業">
+              </div>
+              <div class="form-group">
+                <label for="asgDesc">任務說明</label>
+                <textarea id="asgDesc" placeholder="說明作業目標、繳交格式要求..."></textarea>
+              </div>
+              <div class="form-group">
+                <label for="asgRubric">AI 評分標準 *</label>
+                <textarea id="asgRubric" style="min-height:140px;" placeholder="例如：&#10;1. 程式能正確執行無語法錯誤 (40%)&#10;2. 演算法邏輯與資料清理完整度 (40%)&#10;3. 程式碼註解與說明清晰度 (20%)"></textarea>
+              </div>
+              <div class="form-group">
+                <label for="asgCompetencies">培養的素養與核心能力 <span class="hint">（每行一項，格式「能力名稱: 權重」，權重 1–10 可省略）</span></label>
+                <textarea id="asgCompetencies" style="min-height:100px;" placeholder="例如：&#10;邏輯思考: 3&#10;問題解決: 2&#10;資訊素養: 1"></textarea>
+                <div class="muted">AI 會逐項給 0–100 的評價，累積成學生的 RPG 能力值（權重 × 評價 / 100 × 10）。</div>
+              </div>
+              <div class="grid-2">
+                <div class="form-group">
+                  <label for="asgMaxScore">滿分</label>
+                  <input type="number" id="asgMaxScore" value="100" min="1" max="1000">
+                </div>
+                <div class="form-group">
+                  <label for="asgXpReward">XP 獎勵 <span class="hint">（滿分可得）</span></label>
+                  <input type="number" id="asgXpReward" value="100" min="0" max="10000">
+                </div>
+                <div class="form-group">
+                  <label for="asgDifficulty">難度</label>
+                  <select id="asgDifficulty">
+                    <option value="1">★ 入門</option>
+                    <option value="2">★★ 基礎</option>
+                    <option value="3">★★★ 進階</option>
+                    <option value="4">★★★★ 挑戰</option>
+                    <option value="5">★★★★★ 傳說</option>
+                  </select>
+                </div>
+                <div class="form-group">
+                  <label for="asgQuestType">任務類型</label>
+                  <select id="asgQuestType">
+                    <option value="main">主線任務</option>
+                    <option value="side">支線任務</option>
+                  </select>
+                </div>
+              </div>
+              <div class="form-group">
+                <label for="asgStatus">繳交狀態</label>
+                <select id="asgStatus">
+                  <option value="true">開放繳交</option>
+                  <option value="false">已關閉繳交</option>
+                </select>
+              </div>
+              <div style="display:flex;gap:8px;">
+                <button class="btn btn-primary" id="saveAsgBtn" onclick="handleSaveAssignment()">儲存任務</button>
+                <button class="btn btn-secondary" onclick="resetAssignmentForm()">清除重填</button>
+              </div>
+            </div>
+
+            <div class="card">
+              <h3>現有任務列表</h3>
+              <div id="teacherAsgList"></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 教師分頁 3：冒險者一覽 -->
+        <div id="teacherTab-players" class="hidden">
+          <div class="card">
+            <h3>冒險者一覽 <span class="hint">（依總 XP 排序；每份任務只採計最後一筆繳交）</span></h3>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>冒險者</th>
+                    <th>等級 / 稱號</th>
+                    <th>總 XP</th>
+                    <th>能力值</th>
+                    <th>徽章</th>
+                  </tr>
+                </thead>
+                <tbody id="teacherPlayersBody"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <!-- 教師分頁 4：遊戲設定 -->
+        <div id="teacherTab-settings" class="hidden">
+          <div class="card" style="max-width:640px;">
+            <h3>遊戲設定</h3>
+            <div class="form-group">
+              <label style="display:flex;align-items:center;gap:8px;font-weight:600;">
+                <input type="checkbox" id="setLeaderboard"> 開放學生查看排行榜
+              </label>
+              <div class="muted">排行榜只顯示暱稱、等級與 XP，不顯示 Email。關閉後學生端完全看不到排行資料。</div>
+            </div>
+            <div class="form-group">
+              <label for="setPersona">導師角色設定</label>
+              <textarea id="setPersona" style="min-height:80px;" placeholder="例如：一位睿智、幽默又溫暖的老魔法師導師，稱呼學生為「年輕的冒險者」"></textarea>
+              <div class="muted">AI 會以這個角色的口吻，在每次評分後多寫一段鼓勵評語。</div>
+            </div>
+            <button class="btn btn-primary" id="saveSettingsBtn" onclick="handleSaveSettings()">儲存設定</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- ================= 學生模式 ================= -->
+      <div id="studentView" class="hidden">
+        <!-- 角色卡 -->
+        <div class="card hero-card" id="heroCard"></div>
+
+        <div class="tabs" id="studentTabs">
+          <button class="tab-btn active" data-tab="quests" onclick="switchStudentTab('quests')">📜 任務板</button>
+          <button class="tab-btn" data-tab="badges" onclick="switchStudentTab('badges')">🏅 成就</button>
+          <button class="tab-btn" data-tab="leaderboard" id="leaderboardTabBtn" onclick="switchStudentTab('leaderboard')">🏆 排行榜</button>
+          <button class="tab-btn" data-tab="history" onclick="switchStudentTab('history')">🗂️ 我的紀錄</button>
+        </div>
+
+        <!-- 任務板 -->
+        <div id="studentTab-quests">
+          <div id="questBoard" class="quest-grid"></div>
+
+          <!-- 任務詳情與繳交 -->
+          <div id="questDetail" class="hidden">
+            <button class="btn btn-secondary btn-sm" style="margin-bottom:12px;" onclick="closeQuest()">← 返回任務板</button>
+            <div class="grid-2">
+              <div>
+                <div class="card">
+                  <div id="questInfo"></div>
+                  <div id="submissionFormWrap" style="margin-top:16px;">
+                    <div class="form-group">
+                      <label for="studentTextAnswer">作答區</label>
+                      <textarea id="studentTextAnswer" placeholder="可在此直接輸入作業內容、心得或程式碼說明..."></textarea>
+                    </div>
+                    <div class="form-group">
+                      <label>上傳文字檔案（支援多檔：txt, md, csv, ipynb, py, json, js, html, css, sql...）</label>
+                      <div class="drop-zone" id="dropZone" onclick="document.getElementById('fileInput').click()">
+                        點擊選擇檔案，或將文字檔拖曳至此處<br>
+                        <span class="muted">系統僅讀取純文字存入資料庫，不保留實體檔案。可重複挑戰，只採計最後一次。</span>
+                      </div>
+                      <input type="file" id="fileInput" class="hidden" multiple
+                        accept=".txt,.md,.csv,.ipynb,.py,.json,.js,.jsx,.ts,.tsx,.html,.htm,.css,.scss,.xml,.yaml,.yml,.sql,.java,.c,.cpp,.h,.hpp,.cs,.go,.rs,.php,.rb,.r,.sh,.bat,.ps1,.log,.ini,.toml,.tex">
+                      <div id="selectedFilesList" class="file-list"></div>
+                    </div>
+                    <button class="btn btn-gold" id="submitHomeworkBtn" style="width:100%;" onclick="handleSubmitHomework()">
+                      ⚔️ 送出挑戰，接受 AI 評分
+                    </button>
+                  </div>
+                </div>
+              </div>
+              <div>
+                <div class="card">
+                  <h3>目前採計成績</h3>
+                  <div id="studentLatestGradePanel"></div>
+                  <h3 style="margin-top:20px;">挑戰紀錄</h3>
+                  <div id="studentHistoryPanel"></div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 成就 -->
+        <div id="studentTab-badges" class="hidden">
+          <div class="card">
+            <h3>成就徽章</h3>
+            <div id="badgeWall" class="badge-wall"></div>
+          </div>
+        </div>
+
+        <!-- 排行榜 -->
+        <div id="studentTab-leaderboard" class="hidden">
+          <div class="card">
+            <h3>冒險者排行榜</h3>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>名次</th><th>冒險者</th><th>等級</th><th>總 XP</th><th>徽章</th></tr></thead>
+                <tbody id="leaderboardBody"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <!-- 我的紀錄 -->
+        <div id="studentTab-history" class="hidden">
+          <div class="card">
+            <h3>所有挑戰紀錄</h3>
+            <div id="allHistoryPanel"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 共用 Modal（繳交詳情 / 結算畫面） -->
+  <div id="detailModal" class="modal-backdrop" onclick="if(event.target===this) closeModal()">
+    <div class="modal">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+        <h3 style="margin:0;" id="modalTitle">繳交詳細內容</h3>
+        <button class="btn btn-secondary btn-sm" onclick="closeModal()">關閉</button>
+      </div>
+      <div id="modalBody"></div>
+    </div>
+  </div>
+
+  <?!= include('App'); ?>
+</body>
+</html>

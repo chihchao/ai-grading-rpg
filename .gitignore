@@ -1,0 +1,10 @@
+# clasp：含 scriptId 與試算表 ID，屬個人部署資訊，不公開
+.clasp.json
+.clasprc.json
+
+# Claude Code 本機設定
+.claude/
+
+# 系統檔
+.DS_Store
+node_modules/
