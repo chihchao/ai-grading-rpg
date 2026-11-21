@@ -13,7 +13,8 @@
     selectedFiles: [],
     currentQuestId: '',
     sheetMode: '',
-    viewMode: 'auto'
+    viewMode: 'auto',
+    questFromDoor: false
   };
 
   const world = { ready: false, failed: false, started: false };
@@ -30,7 +31,11 @@
     if (world.started || !window.ClayWorld) return;
     try {
       window.ClayWorld.init(document.getElementById('world'), document.getElementById('labels'), {
-        onQuestClick: openQuest,
+        // 角色走到小屋門口 → 打開作業上傳介面；走開 → 自動收起
+        onQuestEnter: function (id) { openQuest(id, true); },
+        onQuestLeave: function (id) {
+          if (appState.sheetMode === 'quest' && appState.currentQuestId === id && appState.questFromDoor) closeSheet();
+        },
         onAvatarClick: function () { openSheet('stats'); }
       });
       world.started = true;
@@ -54,7 +59,14 @@
 
   function pushWorldData() {
     if (!world.ready || !appState.user) return;
-    window.ClayWorld.setData({ assignments: appState.assignments, profile: appState.profile });
+    window.ClayWorld.setData({
+      assignments: appState.assignments,
+      profile: appState.profile,
+      email: appState.user.email
+    });
+    // HUD 頭像底色跟 3D 角色一致
+    const look = window.ClayWorld.avatarLook(appState.user.email);
+    document.getElementById('hudAvatar').style.background = look.body;
   }
 
   // ==========================================
@@ -98,6 +110,10 @@
     pushWorldData();
     if (world.failed) openSheet('questlist');
     else if (appState.sheetMode && appState.sheetMode !== 'quest') openSheet(appState.sheetMode);
+    if (world.ready && !appState.hintShown && window.matchMedia('(max-width: 860px)').matches) {
+      appState.hintShown = true;
+      showToast('點地面讓角色走過去，走到小屋門口就能交作業！', 5000);
+    }
   }
 
   function avatarEmoji(level) {
@@ -301,16 +317,21 @@
   // 任務詳情與繳交
   // ==========================================
 
-  function openQuest(assignmentId) {
+  /**
+   * 打開任務面板。fromDoor = true 表示角色已站在門口；
+   * 從任務清單點進來時，角色會自動走過去。
+   */
+  function openQuest(assignmentId, fromDoor) {
     const asg = appState.assignments.find(function (a) { return a.assignmentId === assignmentId; });
     if (!asg) return;
+    appState.questFromDoor = Boolean(fromDoor);
     if (appState.currentQuestId !== assignmentId) {
       document.getElementById('studentTextAnswer').value = '';
       appState.selectedFiles = [];
       renderSelectedFiles();
     }
     appState.currentQuestId = assignmentId;
-    if (world.ready) window.ClayWorld.focusQuest(assignmentId);
+    if (world.ready && !fromDoor) window.ClayWorld.walkToQuest(assignmentId);
 
     document.getElementById('sheetTitle').textContent = (asg.questType === 'side' ? '🍄 ' : '🏠 ') + asg.title;
     const canSubmit = asg.isActive || appState.user.isTeacher;

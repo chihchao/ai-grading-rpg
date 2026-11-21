@@ -3,10 +3,14 @@
    * Scene3D.html — 黏土風 3D 島嶼場景（Three.js）
    *
    * 對外 API（window.ClayWorld）：
-   *   init(container, labelLayer, { onQuestClick(id), onAvatarClick() })
-   *   setData({ assignments, profile })   重建任務小屋與角色配件
+   *   init(container, labelLayer, { onQuestEnter(id), onQuestLeave(id), onAvatarClick() })
+   *   setData({ assignments, profile, email })  重建任務小屋；依 email 產生專屬角色
    *   celebrate(levelUp)                  角色跳躍 + 彩紙
-   *   focusQuest(id)                      鏡頭轉向某個任務
+   *   walkToQuest(id)                     角色自動走到該任務的門口
+   *   avatarLook(email)                   取得某 email 對應的角色外觀（HUD 用）
+   *
+   * 操作：WASD / 方向鍵移動、點地面走過去、點小屋（或標籤）會走到門口；
+   * 角色站上門口的地墊時觸發 onQuestEnter，離開時觸發 onQuestLeave。
    * 載入完成時觸發 window 的 'clayworld-ready' 事件；失敗時觸發 'clayworld-failed'。
    */
   import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js';
@@ -25,17 +29,31 @@
   const ISLAND_R = 7.5;
   const MOUND = 0.16; // 島面隆起比例
 
+  const WALK_SPEED = 3.4;      // 每秒移動距離（島嶼座標）
+  const AVATAR_R = 0.5;        // 角色碰撞半徑
+  const PAD_TRIGGER = 0.6;     // 站上門口地墊的判定半徑
+  const WALK_LIMIT = ISLAND_R - 0.9;
+
   let renderer, scene, camera, clock, raycaster, pointer;
   let container, labelLayer, callbacks = {};
-  let island, questLayer, decoLayer, avatar, avatarParts = {}, clouds = [];
-  let quests = []; // { id, group, marker, label, hover, closed, baseY }
+  let island, islandTop, questLayer, decoLayer, avatar, avatarParts = {}, clouds = [];
+  let quests = []; // { id, group, marker, label, hover, closed, pad, padX, padZ }
+  let questObstacles = [], decoObstacles = []; // { x, z, r }
   let confetti = [];
   let clayBump = null;
+  let targetRing = null;
   const matCache = {};
 
-  // 鏡頭（球座標）
-  const cam = { theta: 0.35, phi: 1.02, radius: 18, tTheta: 0.35, tPhi: 1.02, tRadius: 18 };
-  let lastInteract = 0;
+  // 角色移動狀態（島嶼座標）
+  const player = {
+    x: 0, z: 0.4, target: null, path: null, targetQuest: null,
+    moving: false, lastMove: -10, walkPhase: 0, stuck: 0, zone: null
+  };
+  const keys = {};
+
+  // 鏡頭（球座標，繞著角色轉）
+  const cam = { theta: 0.35, phi: 0.98, radius: 13, tTheta: 0.35, tPhi: 0.98, tRadius: 13 };
+  const camTarget = new THREE.Vector3(0, 0.6, 0);
   let drag = null;
   const pinch = { active: false, dist: 0 };
 
@@ -96,6 +114,25 @@
     return mesh(new THREE.SphereGeometry(r, seg || 24, Math.round((seg || 24) * 0.75)), color);
   }
 
+  /** 點到線段 {x1,z1,x2,z2} 的距離 */
+  function distToSegment(x, z, s) {
+    const vx = s.x2 - s.x1, vz = s.z2 - s.z1;
+    const len2 = vx * vx + vz * vz || 1;
+    const t = Math.max(0, Math.min(1, ((x - s.x1) * vx + (z - s.z1) * vz) / len2));
+    const dx = x - (s.x1 + vx * t), dz = z - (s.z1 + vz * t);
+    return Math.sqrt(dx * dx + dz * dz);
+  }
+
+  /** 字串雜湊（FNV-1a），讓同一個 email 永遠得到同一個角色 */
+  function hashString(str) {
+    let h = 2166136261;
+    for (let i = 0; i < str.length; i++) {
+      h ^= str.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+    return h >>> 0;
+  }
+
   /** 島面高度（隆起的枕頭形） */
   function groundY(x, z) {
     const r2 = (x * x + z * z) / (ISLAND_R * ISLAND_R);
@@ -111,6 +148,7 @@
     const top = sphere(ISLAND_R, PALETTE.grass, 64);
     top.scale.set(1, MOUND, 1);
     island.add(top);
+    islandTop = top;
 
     const soil1 = sphere(ISLAND_R * 0.97, PALETTE.soil, 48);
     soil1.scale.set(1, 0.42, 1);
@@ -162,6 +200,7 @@
     g.scale.setScalar(sc);
     g.position.set(x, groundY(x, z) - 0.05, z);
     g.userData.sway = rnd() * Math.PI * 2;
+    g.userData.obstacleR = 0.3 * sc;
     return g;
   }
 
@@ -181,6 +220,7 @@
     }
     g.position.set(x, groundY(x, z) - 0.05, z);
     g.rotation.y = rnd() * Math.PI;
+    g.userData.obstacleR = 0.4;
     return g;
   }
 
@@ -203,11 +243,19 @@
     return g;
   }
 
-  function buildDecorations(occupied) {
+  function buildDecorations(occupied, paths) {
     while (decoLayer.children.length) decoLayer.remove(decoLayer.children[0]);
+    decoObstacles = [];
     const rnd = seeded(2024);
-    function free(x, z, minDist) {
-      if (x * x + z * z < 2.2 * 2.2) return false; // 角色周圍
+    paths = paths || [];
+    function free(x, z, minDist, solid) {
+      if (x * x + z * z < 2.2 * 2.2) return false; // 中央廣場
+      if (solid) {
+        // 樹叢不要擋住角色或通往門口的小路
+        const ax = x - player.x, az = z - player.z;
+        if (ax * ax + az * az < 1.4 * 1.4) return false;
+        if (paths.some(function (s) { return distToSegment(x, z, s) < 0.9; })) return false;
+      }
       return occupied.every(function (p) {
         const dx = p.x - x, dz = p.z - z;
         return dx * dx + dz * dz > minDist * minDist;
@@ -220,8 +268,10 @@
         const a = rnd() * Math.PI * 2;
         const r = 2.4 + rnd() * (ISLAND_R - 3.2);
         const x = Math.cos(a) * r, z = Math.sin(a) * r;
-        if (!free(x, z, minDist)) continue;
-        decoLayer.add(builder(x, z, rnd));
+        if (!free(x, z, minDist, builder !== buildFlower)) continue;
+        const d = builder(x, z, rnd);
+        decoLayer.add(d);
+        if (d.userData.obstacleR) decoObstacles.push({ x: x, z: z, r: d.userData.obstacleR });
         occupied.push({ x: x, z: z });
         made++;
       }
@@ -258,64 +308,247 @@
 
   // ---------- 角色 ----------
 
+  const AVATAR_COLORS = [
+    '#ffd7bf', '#ffc2d1', '#c9e4ff', '#d7c8ff', '#bff0d4', '#fff0a8',
+    '#ffcfa3', '#eadfd6', '#b8e8f0', '#f7c6e6', '#d4f0a8', '#ffb8b0'
+  ];
+  const CHEEK_COLORS = ['#ff9eb3', '#ff8f8f', '#ffb38a', '#f7a1d0'];
+
+  /** 由 email 決定角色外觀：同一個 email 永遠一樣，不同人各不相同 */
+  function avatarLook(email) {
+    const key = String(email || 'guest').trim().toLowerCase();
+    const rnd = seeded(hashString(key));
+    rnd(); rnd(); // 打散前幾個值
+    function pick(arr) { return arr[Math.floor(rnd() * arr.length)]; }
+    const body = pick(AVATAR_COLORS);
+    let accent = pick(PALETTE.roofs);
+    if (accent === body) accent = PALETTE.roofs[(PALETTE.roofs.indexOf(accent) + 2) % PALETTE.roofs.length];
+    return {
+      key: key,
+      body: body,
+      accent: accent,
+      cheek: pick(CHEEK_COLORS),
+      ears: pick(['none', 'cat', 'bear', 'bunny', 'antenna', 'horns', 'tuft']),
+      eyes: pick(['dot', 'oval', 'happy', 'sparkle']),
+      mouth: pick(['smile', 'smile', 'open', 'cat']),
+      pattern: pick(['none', 'belly', 'spots', 'band']),
+      tail: pick(['none', 'ball', 'curl']),
+      size: 0.8 + rnd() * 0.12,
+      squash: 0.86 + rnd() * 0.14
+    };
+  }
+
+  function tint(color, toward, k) {
+    return '#' + new THREE.Color(color).lerp(new THREE.Color(toward), k).getHexString();
+  }
+
   function buildAvatar() {
     avatar = new THREE.Group();
+    avatar.userData.isAvatar = true;
+    island.add(avatar);
+    applyLook(avatarLook(''));
+    avatar.position.set(player.x, groundY(player.x, player.z) - 0.05, player.z);
+  }
+
+  /** 依外觀重建角色身體（保留位置、朝向與等級配件） */
+  function applyLook(look) {
+    if (avatarParts.body) avatar.remove(avatarParts.body);
     const body = new THREE.Group(); // 擠壓伸展用
     avatar.add(body);
+    const skin = look.body;
+    const shade = tint(skin, '#7a5a8a', 0.18);
 
-    const blob = sphere(0.78, PALETTE.avatar, 40);
-    blob.scale.set(1, 0.92, 1);
+    const blob = sphere(0.78, skin, 40);
+    blob.scale.set(1, look.squash, 1);
     blob.position.y = 0.72;
     body.add(blob);
+    const topY = 0.72 + 0.78 * look.squash; // 頭頂高度
 
     const face = new THREE.Group();
     face.position.set(0, 0.8, 0);
     body.add(face);
 
+    // 眼睛
     const eyes = [];
     [-1, 1].forEach(function (s) {
       const eye = new THREE.Group();
-      const ball = sphere(0.085, PALETTE.ink, 16);
-      ball.scale.set(1, 1.2, 0.6);
-      eye.add(ball);
-      const shine = sphere(0.028, '#ffffff', 8);
-      shine.position.set(0.025, 0.035, 0.05);
-      eye.add(shine);
+      if (look.eyes === 'happy') {
+        const arc = mesh(new THREE.TorusGeometry(0.075, 0.024, 8, 16, Math.PI), PALETTE.ink);
+        arc.position.y = -0.03;
+        eye.add(arc);
+      } else {
+        const big = look.eyes === 'sparkle' ? 0.11 : 0.085;
+        const ball = sphere(big, PALETTE.ink, 16);
+        ball.scale.set(1, look.eyes === 'oval' ? 1.55 : 1.2, 0.6);
+        eye.add(ball);
+        const shine = sphere(look.eyes === 'sparkle' ? 0.036 : 0.028, '#ffffff', 8);
+        shine.position.set(0.028, 0.04, 0.05);
+        eye.add(shine);
+        if (look.eyes === 'sparkle') {
+          const shine2 = sphere(0.018, '#ffffff', 8);
+          shine2.position.set(-0.03, -0.035, 0.05);
+          eye.add(shine2);
+        }
+      }
       eye.position.set(0.24 * s, 0.08, 0.7);
       face.add(eye);
       eyes.push(eye);
 
-      const blush = sphere(0.12, PALETTE.blush, 16);
+      const blush = sphere(0.12, look.cheek, 16);
       blush.scale.set(1, 0.55, 0.3);
       blush.position.set(0.42 * s, -0.08, 0.6);
       face.add(blush);
+    });
 
-      const foot = sphere(0.2, PALETTE.avatar, 16);
+    // 嘴巴
+    if (look.mouth === 'open') {
+      const m = sphere(0.07, '#d9576f', 12);
+      m.scale.set(1, 0.8, 0.4);
+      m.position.set(0, -0.08, 0.73);
+      face.add(m);
+    } else if (look.mouth === 'cat') {
+      [-1, 1].forEach(function (s) {
+        const w = mesh(new THREE.TorusGeometry(0.045, 0.018, 8, 12, Math.PI), PALETTE.ink);
+        w.rotation.z = Math.PI;
+        w.position.set(0.045 * s, -0.05, 0.74);
+        face.add(w);
+      });
+    } else {
+      const mouth = mesh(new THREE.TorusGeometry(0.07, 0.022, 8, 16, Math.PI), PALETTE.ink);
+      mouth.rotation.z = Math.PI;
+      mouth.position.set(0, -0.04, 0.74);
+      face.add(mouth);
+    }
+
+    // 手腳（走路時擺動）
+    const feet = [], hands = [];
+    [-1, 1].forEach(function (s) {
+      const foot = sphere(0.2, shade, 16);
       foot.scale.set(1.1, 0.6, 1.3);
       foot.position.set(0.3 * s, 0.08, 0.15);
       body.add(foot);
-
-      const hand = sphere(0.15, PALETTE.avatar, 16);
+      feet.push(foot);
+      const hand = sphere(0.15, skin, 16);
       hand.position.set(0.8 * s, 0.6, 0.1);
       body.add(hand);
+      hands.push(hand);
     });
 
-    const mouth = mesh(new THREE.TorusGeometry(0.07, 0.022, 8, 16, Math.PI), PALETTE.ink);
-    mouth.rotation.z = Math.PI;
-    mouth.position.set(0, -0.04, 0.74);
-    face.add(mouth);
+    // 耳朵 / 頭飾
+    const inner = tint(look.cheek, '#ffffff', 0.3);
+    [-1, 1].forEach(function (s) {
+      if (look.ears === 'cat') {
+        const ear = mesh(new THREE.ConeGeometry(0.19, 0.36, 16), skin);
+        ear.position.set(0.4 * s, topY - 0.12, 0);
+        ear.rotation.z = -0.4 * s;
+        body.add(ear);
+        const ein = mesh(new THREE.ConeGeometry(0.1, 0.2, 12), inner);
+        ein.position.set(0.4 * s, topY - 0.15, 0.09);
+        ein.rotation.z = -0.4 * s;
+        body.add(ein);
+      } else if (look.ears === 'bear') {
+        const ear = sphere(0.18, skin, 16);
+        ear.position.set(0.46 * s, topY - 0.18, 0);
+        body.add(ear);
+        const ein = sphere(0.09, inner, 12);
+        ein.scale.z = 0.5;
+        ein.position.set(0.46 * s, topY - 0.18, 0.12);
+        body.add(ein);
+      } else if (look.ears === 'bunny') {
+        const ear = mesh(new THREE.CapsuleGeometry(0.1, 0.42, 6, 12), skin);
+        ear.position.set(0.22 * s, topY + 0.2, -0.05);
+        ear.rotation.z = -0.18 * s;
+        body.add(ear);
+        const ein = mesh(new THREE.CapsuleGeometry(0.05, 0.3, 6, 10), inner);
+        ein.position.set(0.22 * s, topY + 0.2, 0.03);
+        ein.rotation.z = -0.18 * s;
+        body.add(ein);
+      } else if (look.ears === 'antenna') {
+        const stick = mesh(new THREE.CylinderGeometry(0.022, 0.022, 0.32, 8), shade);
+        stick.position.set(0.2 * s, topY + 0.1, 0);
+        stick.rotation.z = -0.25 * s;
+        body.add(stick);
+        const bob = sphere(0.08, look.accent, 12);
+        bob.position.set(0.24 * s, topY + 0.27, 0);
+        body.add(bob);
+      } else if (look.ears === 'horns') {
+        const horn = mesh(new THREE.ConeGeometry(0.09, 0.26, 12), PALETTE.cream);
+        horn.position.set(0.3 * s, topY + 0.02, 0.12);
+        horn.rotation.z = -0.3 * s;
+        body.add(horn);
+      }
+    });
+    if (look.ears === 'tuft') {
+      [[0, 0.06, 0.1], [-0.12, 0.02, 0.07], [0.12, 0.02, 0.07]].forEach(function (p) {
+        const t = sphere(p[2], skin, 12);
+        t.position.set(p[0], topY + p[1], 0.05);
+        body.add(t);
+      });
+    }
+
+    // 花紋
+    if (look.pattern === 'belly') {
+      const belly = sphere(0.48, tint(skin, '#ffffff', 0.55), 24);
+      belly.scale.set(1, 0.95, 0.45);
+      belly.position.set(0, 0.48, 0.46);
+      body.add(belly);
+    } else if (look.pattern === 'spots') {
+      const rnd = seeded(hashString(look.key + '#spots'));
+      for (let i = 0; i < 5; i++) {
+        const a = Math.PI * (0.6 + rnd() * 0.4) * (i % 2 ? 1 : -1); // 背面與側面（a≈π 為背面）
+        const el = 0.15 + rnd() * 0.5;
+        const spot = sphere(0.1 + rnd() * 0.05, look.accent, 12);
+        spot.scale.set(1, 1, 0.4);
+        const r = 0.76;
+        spot.position.set(Math.sin(a) * Math.cos(el) * r, 0.72 + Math.sin(el) * r * look.squash, Math.cos(a) * Math.cos(el) * r);
+        spot.lookAt(spot.position.x * 2, spot.position.y, spot.position.z * 2);
+        body.add(spot);
+      }
+    } else if (look.pattern === 'band') {
+      const band = mesh(new THREE.TorusGeometry(0.69, 0.05, 10, 36), look.accent);
+      band.rotation.x = Math.PI / 2;
+      band.position.y = 0.72 + 0.35 * look.squash;
+      band.scale.set(1, 1, 1);
+      body.add(band);
+    }
+
+    // 尾巴
+    if (look.tail === 'ball') {
+      const tail = sphere(0.16, tint(skin, '#ffffff', 0.5), 14);
+      tail.position.set(0, 0.42, -0.76);
+      body.add(tail);
+    } else if (look.tail === 'curl') {
+      const curve = new THREE.CatmullRomCurve3([
+        new THREE.Vector3(0, 0.35, -0.65), new THREE.Vector3(0, 0.35, -1.0),
+        new THREE.Vector3(0, 0.7, -1.1), new THREE.Vector3(0, 0.85, -0.9)
+      ]);
+      const tail = mesh(new THREE.TubeGeometry(curve, 20, 0.07, 8, false), skin);
+      body.add(tail);
+      const tip = sphere(0.09, look.accent, 10);
+      tip.position.set(0, 0.85, -0.9);
+      body.add(tip);
+    }
 
     const accessory = new THREE.Group();
+    accessory.position.y = topY - 1.44; // 等級配件跟著頭頂高度
     body.add(accessory);
 
-    avatarParts = { body: body, eyes: eyes, accessory: accessory, jump: 0, nextBlink: 2 };
-    avatar.scale.setScalar(1.45);
-    avatar.position.set(0, groundY(0, 0) - 0.05, 0);
-    avatar.userData.isAvatar = true;
-    island.add(avatar);
+    avatarParts = {
+      body: body, eyes: eyes, feet: feet, hands: hands, accessory: accessory,
+      jump: avatarParts.jump || 0, nextBlink: avatarParts.nextBlink || 2,
+      lookKey: look.key, level: avatarParts.level || 0
+    };
+    avatar.scale.setScalar(look.size);
+    if (avatarParts.level) {
+      const lv = avatarParts.level;
+      avatarParts.level = 0;
+      setAvatarLevel(lv);
+    }
   }
 
   function setAvatarLevel(level) {
+    if (avatarParts.level === level) return;
+    avatarParts.level = level;
     const acc = avatarParts.accessory;
     while (acc.children.length) acc.remove(acc.children[0]);
     const top = 1.42;
@@ -485,9 +718,23 @@
     return out;
   }
 
+  function buildPad(color) {
+    const g = new THREE.Group();
+    const mat = mesh(new THREE.CylinderGeometry(0.5, 0.54, 0.08, 28), tint(color, '#ffffff', 0.35));
+    mat.position.y = 0.04;
+    g.add(mat);
+    const ring = mesh(new THREE.TorusGeometry(0.5, 0.05, 8, 32), color, { emissive: color, emissiveIntensity: 0 });
+    ring.rotation.x = Math.PI / 2;
+    ring.position.y = 0.09;
+    g.add(ring);
+    g.userData.ring = ring;
+    return g;
+  }
+
   function clearQuests() {
     quests.forEach(function (q) { if (q.label) q.label.remove(); });
     quests = [];
+    questObstacles = [];
     while (questLayer.children.length) questLayer.remove(questLayer.children[0]);
   }
 
@@ -512,8 +759,19 @@
       const p = pos[i];
       const baseY = groundY(p.x, p.z) - 0.04 - (closed ? 0.12 : 0);
       g.position.set(p.x, baseY, p.z);
-      g.lookAt(p.x * 2, baseY, p.z * 2); // 門朝外
+      g.lookAt(0, baseY, 0); // 門朝向中央廣場
       g.userData.questId = a.assignmentId;
+
+      // 碰撞範圍與門口地墊
+      const footR = (a.questType === 'side' ? 0.42 : 0.66) * scale;
+      questObstacles.push({ x: p.x, z: p.z, r: footR });
+      const len = Math.sqrt(p.x * p.x + p.z * p.z) || 1;
+      const padDist = footR + AVATAR_R + 0.12;
+      const padX = p.x - p.x / len * padDist, padZ = p.z - p.z / len * padDist;
+      const padColor = closed ? PALETTE.grey : (a.questType === 'side' ? PALETTE.caps[i % PALETTE.caps.length] : PALETTE.roofs[i % PALETTE.roofs.length]);
+      const pad = buildPad(padColor);
+      pad.position.set(padX, groundY(padX, padZ) - 0.06, padZ);
+      questLayer.add(pad);
 
       let marker = null;
       if (status !== 'closed') {
@@ -532,16 +790,26 @@
       label.innerHTML = '<span class="ql-title"></span><span class="ql-status"></span>';
       label.querySelector('.ql-title').textContent = a.title;
       label.querySelector('.ql-status').textContent = (a.questType === 'side' ? '支線・' : '主線・') + statusText;
-      label.addEventListener('click', function () { if (callbacks.onQuestClick) callbacks.onQuestClick(a.assignmentId); });
+      label.addEventListener('click', function () { walkToQuest(a.assignmentId); });
       labelLayer.appendChild(label);
 
       quests.push({
         id: a.assignmentId, group: g, marker: marker, label: label,
         hover: 0, closed: closed, labelHeight: built.height * scale + 1.0,
-        phase: i * 0.7
+        phase: i * 0.7, pad: pad, padX: padX, padZ: padZ
       });
     });
-    buildDecorations(pos.map(function (p) { return { x: p.x, z: p.z }; }));
+    const occupied = pos.map(function (p) { return { x: p.x, z: p.z }; });
+    const paths = quests.map(function (q) { return { x1: 0, z1: 0, x2: q.padX, z2: q.padZ }; });
+    buildDecorations(occupied, paths);
+    // 新的小屋可能蓋在角色身上：先把角色推開；若已站在某個門口，不重複觸發
+    resolveCollisions();
+    if (avatar) avatar.position.set(player.x, groundY(player.x, player.z) - 0.05, player.z);
+    player.zone = currentZone();
+    if (player.targetQuest && !quests.some(function (q) { return q.id === player.targetQuest; })) {
+      player.targetQuest = null;
+      player.target = null;
+    }
   }
 
   // ---------- 彩紙與慶祝 ----------
@@ -571,19 +839,222 @@
     }
   }
 
-  function focusQuest(id) {
+  /** 自動走到任務門口（抵達後由地墊觸發 onQuestEnter） */
+  function walkToQuest(id) {
     const q = quests.find(function (x) { return x.id === id; });
     if (!q) return;
-    const p = q.group.position;
-    cam.tTheta = Math.atan2(p.x, p.z);
-    lastInteract = clock.elapsedTime;
+    if (player.zone === id) {
+      // 已經站在門口：直接再開一次
+      if (callbacks.onQuestEnter) callbacks.onQuestEnter(id);
+      return;
+    }
+    setRoute(q.padX, q.padZ);
+    player.targetQuest = id;
+    showTargetRing(q.padX, q.padZ);
+    // 鏡頭轉到能看見目的地的方向
+    const dx = q.padX - player.x, dz = q.padZ - player.z;
+    if (dx * dx + dz * dz > 4) cam.tTheta = lerpAngle(cam.tTheta, Math.atan2(-dx, -dz), 0.5);
+  }
+
+  function walkTo(x, z) {
+    const r = Math.sqrt(x * x + z * z);
+    if (r > WALK_LIMIT) { x *= WALK_LIMIT / r; z *= WALK_LIMIT / r; }
+    setRoute(x, z);
+    player.targetQuest = null;
+    showTargetRing(x, z);
+  }
+
+  function setRoute(x, z) {
+    resolveCollisions();
+    player.path = findPath(player.x, player.z, x, z);
+    player.target = player.path.shift();
+    player.stuck = 0;
+  }
+
+  function showTargetRing(x, z) {
+    if (!targetRing) {
+      targetRing = mesh(new THREE.TorusGeometry(0.32, 0.05, 8, 28), '#ffffff', { transparent: true, opacity: 0.9 });
+      targetRing.rotation.x = Math.PI / 2;
+      targetRing.castShadow = false;
+      island.add(targetRing);
+    }
+    targetRing.position.set(x, groundY(x, z) + 0.06, z);
+    targetRing.userData.life = 1;
+    targetRing.visible = true;
+  }
+
+  function currentZone() {
+    let best = null, bestD = PAD_TRIGGER * PAD_TRIGGER;
+    quests.forEach(function (q) {
+      const dx = q.padX - player.x, dz = q.padZ - player.z;
+      const d = dx * dx + dz * dz;
+      if (d < bestD) { bestD = d; best = q.id; }
+    });
+    return best;
+  }
+
+  /** 把角色推出障礙物並限制在島上 */
+  function resolveCollisions() {
+    for (let iter = 0; iter < 2; iter++) {
+      [questObstacles, decoObstacles].forEach(function (list) {
+        list.forEach(function (o) {
+          const dx = player.x - o.x, dz = player.z - o.z;
+          const min = o.r + AVATAR_R;
+          const d2 = dx * dx + dz * dz;
+          if (d2 < min * min) {
+            const d = Math.sqrt(d2) || 0.0001;
+            player.x = o.x + dx / d * min;
+            player.z = o.z + dz / d * min;
+          }
+        });
+      });
+    }
+    const r = Math.sqrt(player.x * player.x + player.z * player.z);
+    if (r > WALK_LIMIT) { player.x *= WALK_LIMIT / r; player.z *= WALK_LIMIT / r; }
+  }
+
+  // ---------- 尋路（格子 A*，島很小所以很便宜） ----------
+
+  const GRID = 0.25;
+  const GRID_N = Math.ceil(ISLAND_R * 2 / GRID);
+
+  function blockedAt(x, z, margin) {
+    if (x * x + z * z > WALK_LIMIT * WALK_LIMIT) return true;
+    const lists = [questObstacles, decoObstacles];
+    for (let l = 0; l < 2; l++) {
+      const list = lists[l];
+      for (let i = 0; i < list.length; i++) {
+        const o = list[i];
+        const dx = x - o.x, dz = z - o.z, min = o.r + AVATAR_R + margin;
+        if (dx * dx + dz * dz < min * min) return true;
+      }
+    }
+    return false;
+  }
+
+  function lineFree(x1, z1, x2, z2) {
+    const len = Math.hypot(x2 - x1, z2 - z1);
+    const steps = Math.max(1, Math.ceil(len / 0.1));
+    for (let i = 1; i <= steps; i++) {
+      const k = i / steps;
+      if (blockedAt(x1 + (x2 - x1) * k, z1 + (z2 - z1) * k, 0.03)) return false;
+    }
+    return true;
+  }
+
+  /** 回傳從 (sx,sz) 到 (tx,tz) 的路徑點；找不到時回傳直線 */
+  function findPath(sx, sz, tx, tz) {
+    if (lineFree(sx, sz, tx, tz)) return [{ x: tx, z: tz }];
+    const toCell = function (v) { return Math.max(0, Math.min(GRID_N - 1, Math.floor((v + ISLAND_R) / GRID))); };
+    const center = function (c) { return c * GRID - ISLAND_R + GRID / 2; };
+    const N = GRID_N;
+    const blocked = new Uint8Array(N * N);
+    for (let i = 0; i < N; i++) for (let j = 0; j < N; j++) blocked[i * N + j] = blockedAt(center(i), center(j), 0.02) ? 1 : 0;
+    const start = toCell(sx) * N + toCell(sz);
+    let goal = toCell(tx) * N + toCell(tz);
+    blocked[start] = 0;
+    if (blocked[goal]) {
+      // 目的地被擋住：找最近的空格
+      let best = -1, bd = Infinity;
+      for (let k = 0; k < N * N; k++) {
+        if (blocked[k]) continue;
+        const d = Math.hypot(center(Math.floor(k / N)) - tx, center(k % N) - tz);
+        if (d < bd) { bd = d; best = k; }
+      }
+      if (best < 0) return [{ x: tx, z: tz }];
+      goal = best;
+    }
+    const g = new Float32Array(N * N).fill(Infinity);
+    const from = new Int32Array(N * N).fill(-1);
+    const closed = new Uint8Array(N * N);
+    const open = [start];
+    g[start] = 0;
+    const gi = Math.floor(goal / N), gj = goal % N;
+    const h = function (k) { return Math.hypot(Math.floor(k / N) - gi, k % N - gj); };
+    let found = false;
+    while (open.length) {
+      let bi = 0, bf = Infinity;
+      for (let k = 0; k < open.length; k++) {
+        const f = g[open[k]] + h(open[k]);
+        if (f < bf) { bf = f; bi = k; }
+      }
+      const cur = open[bi];
+      open[bi] = open[open.length - 1];
+      open.pop();
+      if (cur === goal) { found = true; break; }
+      if (closed[cur]) continue;
+      closed[cur] = 1;
+      const ci = Math.floor(cur / N), cj = cur % N;
+      for (let di = -1; di <= 1; di++) {
+        for (let dj = -1; dj <= 1; dj++) {
+          if (!di && !dj) continue;
+          const ni = ci + di, nj = cj + dj;
+          if (ni < 0 || nj < 0 || ni >= N || nj >= N) continue;
+          const nk = ni * N + nj;
+          if (blocked[nk] || closed[nk]) continue;
+          if (di && dj && (blocked[ci * N + nj] || blocked[ni * N + cj])) continue; // 不切角
+          const ng = g[cur] + (di && dj ? 1.4142 : 1);
+          if (ng < g[nk]) {
+            g[nk] = ng;
+            from[nk] = cur;
+            open.push(nk);
+          }
+        }
+      }
+    }
+    if (!found) return [{ x: tx, z: tz }];
+    const cells = [];
+    for (let k = goal; k !== -1 && k !== start; k = from[k]) cells.push({ x: center(Math.floor(k / N)), z: center(k % N) });
+    cells.reverse();
+    if (goal === toCell(tx) * N + toCell(tz)) cells[cells.length - 1] = { x: tx, z: tz };
+    // 拉直：能直線到達的點就跳過中間點
+    const out = [];
+    let cx = sx, cz = sz, i = 0;
+    while (i < cells.length) {
+      let j = cells.length - 1;
+      while (j > i && !lineFree(cx, cz, cells[j].x, cells[j].z)) j--;
+      out.push(cells[j]);
+      cx = cells[j].x; cz = cells[j].z;
+      i = j + 1;
+    }
+    return out;
+  }
+
+  function isTyping(e) {
+    const el = e.target;
+    if (!el || !el.tagName) return false;
+    const tag = el.tagName.toLowerCase();
+    return tag === 'input' || tag === 'textarea' || tag === 'select' || el.isContentEditable;
+  }
+
+  const KEY_DIRS = {
+    w: 'up', arrowup: 'up', s: 'down', arrowdown: 'down',
+    a: 'left', arrowleft: 'left', d: 'right', arrowright: 'right'
+  };
+
+  function onKeyDown(e) {
+    if (isTyping(e) || e.metaKey || e.ctrlKey || e.altKey) return;
+    const dir = KEY_DIRS[e.key.toLowerCase()];
+    if (!dir) return;
+    if (document.querySelector('.modal-backdrop.open')) return;
+    keys[dir] = true;
+    player.target = null;
+    player.targetQuest = null;
+    e.preventDefault();
+  }
+
+  function onKeyUp(e) {
+    const dir = KEY_DIRS[(e.key || '').toLowerCase()];
+    if (dir) keys[dir] = false;
   }
 
   // ---------- 互動 ----------
 
   function onPointerDown(e) {
+    const rect = renderer.domElement.getBoundingClientRect();
+    pointer.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+    pointer.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
     drag = { x: e.clientX, y: e.clientY, sx: e.clientX, sy: e.clientY, moved: false, id: e.pointerId };
-    lastInteract = clock.elapsedTime;
   }
 
   function onPointerMove(e) {
@@ -595,15 +1066,23 @@
     drag.x = e.clientX; drag.y = e.clientY;
     if (Math.abs(e.clientX - drag.sx) + Math.abs(e.clientY - drag.sy) > 6) drag.moved = true;
     cam.tTheta -= dx * 0.008;
-    cam.tPhi = Math.max(0.55, Math.min(1.3, cam.tPhi - dy * 0.005));
-    lastInteract = clock.elapsedTime;
+    cam.tPhi = Math.max(0.55, Math.min(1.25, cam.tPhi - dy * 0.005));
   }
 
   function onPointerUp(e) {
-    if (drag && !drag.moved) {
+    if (drag && !drag.moved && e.target === renderer.domElement) {
       const hit = pick();
-      if (hit && hit.questId && callbacks.onQuestClick) callbacks.onQuestClick(hit.questId);
+      if (hit && hit.questId) walkToQuest(hit.questId);
       else if (hit && hit.avatar && callbacks.onAvatarClick) callbacks.onAvatarClick();
+      else {
+        // 點地面：走過去
+        raycaster.setFromCamera(pointer, camera);
+        const g = raycaster.intersectObject(islandTop, false);
+        if (g.length) {
+          const local = island.worldToLocal(g[0].point.clone());
+          walkTo(local.x, local.z);
+        }
+      }
     }
     drag = null;
   }
@@ -624,8 +1103,7 @@
 
   function onWheel(e) {
     e.preventDefault();
-    cam.tRadius = Math.max(11, Math.min(cam.maxR || 26, cam.tRadius + e.deltaY * 0.01));
-    lastInteract = clock.elapsedTime;
+    cam.tRadius = Math.max(7, Math.min(cam.maxR || 26, cam.tRadius + e.deltaY * 0.01));
   }
 
   function onTouchStart(e) {
@@ -638,9 +1116,9 @@
     if (pinch.active && e.touches.length === 2) {
       e.preventDefault();
       const d = touchDist(e);
-      cam.tRadius = Math.max(11, Math.min(cam.maxR || 26, cam.tRadius - (d - pinch.dist) * 0.03));
+      cam.tRadius = Math.max(7, Math.min(cam.maxR || 26, cam.tRadius - (d - pinch.dist) * 0.03));
       pinch.dist = d;
-      lastInteract = clock.elapsedTime;
+      if (drag) drag.moved = true;
     }
   }
   function onTouchEnd(e) {
@@ -659,14 +1137,15 @@
     camera.aspect = w / h;
     camera.fov = w / h < 0.8 ? 50 : 42;
     camera.updateProjectionMatrix();
-    // 依畫面比例算出能塞下整座島的鏡頭距離（直式螢幕會拉遠）
+    // 跟隨鏡頭：預設距離依畫面比例調整（直式螢幕拉遠一些），最遠可看見整座島
     const hHalf = Math.atan(Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)) * camera.aspect);
     const fit = Math.max(18, (ISLAND_R + 1) / Math.tan(hHalf));
-    const prevBase = cam.base || 18;
-    cam.base = fit;
-    cam.maxR = fit + 8;
-    cam.tRadius = Math.min(cam.maxR, Math.max(11, cam.tRadius * fit / prevBase));
-    if (!cam.sized) { cam.radius = cam.tRadius; cam.sized = true; }
+    const base = Math.max(11, Math.min(fit * 0.62, 20));
+    const prevBase = cam.base || base;
+    cam.base = base;
+    cam.maxR = fit + 4;
+    cam.tRadius = Math.min(cam.maxR, Math.max(7, cam.tRadius * base / prevBase));
+    if (!cam.sized) { cam.tRadius = base; cam.radius = base; cam.sized = true; }
   }
 
   // ---------- 動畫迴圈 ----------
@@ -677,30 +1156,51 @@
     const dt = Math.min(clock.getDelta(), 0.05);
     const t = clock.elapsedTime;
 
-    // 閒置時緩慢自轉
-    if (t - lastInteract > 5 && !drag) cam.tTheta += dt * 0.06;
+    updatePlayer(dt, t);
+
+    // 跟隨鏡頭
+    tmpV.set(player.x, groundY(player.x, player.z) + 0.7, player.z);
+    island.localToWorld(tmpV);
+    camTarget.lerp(tmpV, Math.min(1, dt * 5));
     cam.theta += (cam.tTheta - cam.theta) * Math.min(1, dt * 6);
     cam.phi += (cam.tPhi - cam.phi) * Math.min(1, dt * 6);
     cam.radius += (cam.tRadius - cam.radius) * Math.min(1, dt * 6);
     camera.position.set(
-      Math.sin(cam.theta) * Math.sin(cam.phi) * cam.radius,
-      Math.cos(cam.phi) * cam.radius + 0.5,
-      Math.cos(cam.theta) * Math.sin(cam.phi) * cam.radius
+      camTarget.x + Math.sin(cam.theta) * Math.sin(cam.phi) * cam.radius,
+      camTarget.y + Math.cos(cam.phi) * cam.radius,
+      camTarget.z + Math.cos(cam.theta) * Math.sin(cam.phi) * cam.radius
     );
-    camera.lookAt(0, 0.4, 0);
+    camera.lookAt(camTarget);
 
     island.position.y = Math.sin(t * 0.6) * 0.08;
 
-    // 角色：呼吸般的擠壓伸展、眨眼、跳躍、面向鏡頭
+    // 角色：呼吸般的擠壓伸展、眨眼、跳躍、走路擺動
     const b = avatarParts.body;
     let hop = 0;
     if (avatarParts.jump > 0) {
       avatarParts.jump = Math.max(0, avatarParts.jump - dt);
       hop = Math.abs(Math.sin(avatarParts.jump * Math.PI * 2.5)) * 0.9;
     }
-    const squash = 1 + Math.sin(t * 2.2) * 0.035;
+    const walkK = player.moving ? 1 : 0;
+    avatarParts.walkK = (avatarParts.walkK || 0) + (walkK - (avatarParts.walkK || 0)) * Math.min(1, dt * 10);
+    const wk = avatarParts.walkK;
+    const step = Math.sin(player.walkPhase);
+    hop += Math.abs(step) * 0.12 * wk;
+    const squash = 1 + Math.sin(t * 2.2) * 0.035 * (1 - wk) + Math.abs(Math.cos(player.walkPhase)) * 0.05 * wk;
     b.scale.set(1 / Math.sqrt(squash), squash, 1 / Math.sqrt(squash));
     b.position.y = hop;
+    b.rotation.x = 0.1 * wk; // 走路時微微前傾
+    b.rotation.z = step * 0.07 * wk;
+    avatarParts.feet.forEach(function (f, i) {
+      const sgn = i ? 1 : -1;
+      f.position.z = 0.15 + step * 0.22 * sgn * wk;
+      f.position.y = 0.08 + Math.max(0, step * sgn) * 0.12 * wk;
+    });
+    avatarParts.hands.forEach(function (h, i) {
+      const sgn = i ? -1 : 1;
+      h.position.z = 0.1 + step * 0.18 * sgn * wk;
+      h.position.y = 0.6 + Math.sin(t * 2.2 + i) * 0.02 * (1 - wk);
+    });
     if (t > avatarParts.nextBlink) {
       avatarParts.eyes.forEach(function (eye) { eye.scale.y = 0.12; });
       if (t > avatarParts.nextBlink + 0.12) {
@@ -708,9 +1208,26 @@
         avatarParts.nextBlink = t + 2 + Math.random() * 3;
       }
     }
-    const camAngle = Math.atan2(camera.position.x, camera.position.z);
-    avatar.rotation.y = lerpAngle(avatar.rotation.y, camAngle, Math.min(1, dt * 3));
+    if (!player.moving && t - player.lastMove > 2.5) {
+      // 閒置一陣子就轉頭看鏡頭
+      const camAngle = Math.atan2(camera.position.x - camTarget.x, camera.position.z - camTarget.z);
+      avatar.rotation.y = lerpAngle(avatar.rotation.y, camAngle, Math.min(1, dt * 2));
+    }
     avatarParts.accessory.children.forEach(function (c) { if (c.userData.spin) c.rotation.z += dt; });
+
+    // 門口地墊：角色站上去時發光
+    quests.forEach(function (q) {
+      const ring = q.pad.userData.ring;
+      const on = player.zone === q.id || player.targetQuest === q.id;
+      ring.material.emissiveIntensity += ((on ? 0.6 + Math.sin(t * 5) * 0.25 : 0) - ring.material.emissiveIntensity) * Math.min(1, dt * 8);
+      q.pad.scale.setScalar(1 + (player.zone === q.id ? 0.08 : 0));
+    });
+    if (targetRing && targetRing.visible) {
+      targetRing.userData.life -= dt * 0.8;
+      targetRing.material.opacity = Math.max(0, targetRing.userData.life);
+      targetRing.scale.setScalar(1 + (1 - targetRing.userData.life) * 0.6);
+      if (targetRing.userData.life <= 0 || !player.target) targetRing.visible = false;
+    }
 
     // 滑鼠懸停
     let hovered = null;
@@ -774,6 +1291,67 @@
     renderer.render(scene, camera);
   }
 
+  /** 依鍵盤或點擊目標移動角色，並偵測是否站上門口 */
+  function updatePlayer(dt, t) {
+    let dirX = 0, dirZ = 0;
+    const kx = (keys.right ? 1 : 0) - (keys.left ? 1 : 0);
+    const kz = (keys.up ? 1 : 0) - (keys.down ? 1 : 0);
+    if (kx || kz) {
+      // 以鏡頭方向為準：上 = 往畫面深處
+      const s = Math.sin(cam.theta), c = Math.cos(cam.theta);
+      dirX = -s * kz + c * kx;
+      dirZ = -c * kz - s * kx;
+    } else if (player.target) {
+      const dx = player.target.x - player.x, dz = player.target.z - player.z;
+      const d = Math.sqrt(dx * dx + dz * dz);
+      const last = !player.path || !player.path.length;
+      if (!last && d < 0.25) {
+        player.target = player.path.shift(); // 下一個路徑點
+        dirX = dx / d; dirZ = dz / d;
+      } else if (d < 0.08) {
+        player.target = null;
+      } else {
+        dirX = dx / d; dirZ = dz / d;
+        if (last && d < 0.4) { dirX *= d / 0.4; dirZ *= d / 0.4; } // 接近時放慢
+      }
+    }
+
+    const mag = Math.sqrt(dirX * dirX + dirZ * dirZ);
+    player.moving = mag > 0.01;
+    if (player.moving) {
+      const nx = dirX / mag, nz = dirZ / mag;
+      const speed = WALK_SPEED * Math.min(1, mag);
+      const ox = player.x, oz = player.z;
+      player.x += nx * speed * dt;
+      player.z += nz * speed * dt;
+      resolveCollisions();
+      const moved = Math.hypot(player.x - ox, player.z - oz);
+      player.walkPhase += moved * 4.2;
+      player.lastMove = t;
+      avatar.rotation.y = lerpAngle(avatar.rotation.y, Math.atan2(nx, nz), Math.min(1, dt * 12));
+      // 卡住太久就放棄自動行走
+      if (player.target) {
+        player.stuck = moved < speed * dt * 0.2 ? player.stuck + dt : 0;
+        if (player.stuck > 0.8) { player.target = null; player.targetQuest = null; }
+      }
+    }
+    avatar.position.set(player.x, groundY(player.x, player.z) - 0.05, player.z);
+
+    const zone = currentZone();
+    if (zone !== player.zone) {
+      const prev = player.zone;
+      player.zone = zone;
+      if (prev && callbacks.onQuestLeave) callbacks.onQuestLeave(prev);
+      // 自動走向別的目的地途中經過的門口不觸發
+      if (zone && (!player.target || player.targetQuest === zone)) {
+        player.target = null;
+        player.targetQuest = null;
+        avatarParts.jump = Math.max(avatarParts.jump, 0.35);
+        if (callbacks.onQuestEnter) callbacks.onQuestEnter(zone);
+      }
+    }
+  }
+
   function lerpAngle(a, b, k) {
     let d = ((b - a + Math.PI) % (Math.PI * 2)) - Math.PI;
     if (d < -Math.PI) d += Math.PI * 2;
@@ -834,12 +1412,17 @@
     el.addEventListener('touchstart', onTouchStart, { passive: true });
     el.addEventListener('touchmove', onTouchMove, { passive: false });
     el.addEventListener('touchend', onTouchEnd);
+    window.addEventListener('keydown', onKeyDown);
+    window.addEventListener('keyup', onKeyUp);
+    window.addEventListener('blur', function () { Object.keys(keys).forEach(function (k) { keys[k] = false; }); });
     new ResizeObserver(resize).observe(container);
     resize();
     renderer.setAnimationLoop(animate);
   }
 
   function setData(data) {
+    const look = avatarLook(data.email);
+    if (look.key !== avatarParts.lookKey) applyLook(look);
     buildQuests(data.assignments || [], data.profile);
     setAvatarLevel((data.profile && data.profile.level) || 1);
   }
@@ -854,7 +1437,10 @@
   }
 
   if (webglAvailable()) {
-    window.ClayWorld = { init: init, setData: setData, celebrate: celebrate, focusQuest: focusQuest };
+    window.ClayWorld = {
+      init: init, setData: setData, celebrate: celebrate,
+      walkToQuest: walkToQuest, avatarLook: avatarLook
+    };
     window.dispatchEvent(new Event('clayworld-ready'));
   } else {
     window.dispatchEvent(new Event('clayworld-failed'));
