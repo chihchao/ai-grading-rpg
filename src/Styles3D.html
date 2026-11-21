@@ -167,6 +167,25 @@
     position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); z-index: 15;
     padding: 8px 18px; font-size: 0.85rem; color: var(--muted); white-space: nowrap; border-radius: 999px;
   }
+  /* ===== 虛擬搖桿（觸控裝置） ===== */
+  .joystick {
+    position: fixed; left: 22px; bottom: 28px; z-index: 18;
+    width: 124px; height: 124px; border-radius: 50%;
+    background: rgba(255, 250, 244, 0.55);
+    box-shadow: var(--clay-shadow-sm);
+    backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px);
+    touch-action: none; user-select: none; -webkit-user-select: none;
+    display: flex; align-items: center; justify-content: center;
+    transition: background 0.2s;
+  }
+  .joystick.active { background: rgba(255, 250, 244, 0.8); }
+  .joystick-knob {
+    width: 54px; height: 54px; border-radius: 50%; pointer-events: none;
+    background: linear-gradient(145deg, #ffc2d1, var(--pink));
+    box-shadow: var(--clay-shadow-sm);
+    transition: transform 0.15s cubic-bezier(.34,1.56,.64,1);
+  }
+  .joystick.active .joystick-knob { transition: none; }
   .toast {
     position: fixed; top: 96px; left: 50%; transform: translateX(-50%); z-index: 30;
     padding: 10px 18px; max-width: calc(100vw - 32px);
@@ -184,6 +203,7 @@
     .quest-label .ql-status { font-size: 0.62rem; }
     .hud-menu .btn { flex-shrink: 0; padding: 8px 12px; font-size: 0.85rem; }
     .hud-hint { display: none; }
+    .joystick { bottom: 84px; left: 16px; width: 112px; height: 112px; } /* 避開底部選單列 */
     .hud-player { padding: 10px 14px; }
     .hud-avatar { width: 48px; height: 48px; font-size: 1.6rem; }
   }

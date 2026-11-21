@@ -36,7 +36,8 @@
         onQuestLeave: function (id) {
           if (appState.sheetMode === 'quest' && appState.currentQuestId === id && appState.questFromDoor) closeSheet();
         },
-        onAvatarClick: function () { openSheet('stats'); }
+        onAvatarClick: function () { openSheet('stats'); },
+        joystick: document.getElementById('joystick')
       });
       world.started = true;
       world.ready = true;
@@ -110,9 +111,9 @@
     pushWorldData();
     if (world.failed) openSheet('questlist');
     else if (appState.sheetMode && appState.sheetMode !== 'quest') openSheet(appState.sheetMode);
-    if (world.ready && !appState.hintShown && window.matchMedia('(max-width: 860px)').matches) {
+    if (world.ready && !appState.hintShown && (window.matchMedia('(max-width: 860px)').matches || window.matchMedia('(pointer: coarse)').matches)) {
       appState.hintShown = true;
-      showToast('點地面讓角色走過去，走到小屋門口就能交作業！', 5000);
+      showToast('用左下角搖桿或點地面移動，走到小屋門口就能交作業！', 5000);
     }
   }
 
